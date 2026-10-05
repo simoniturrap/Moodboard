@@ -1,0 +1,257 @@
+import Foundation
+import CoreGraphics
+
+/// Tipo de pieza que vive en un tablero.
+enum ItemKind: String, Codable {
+    case image      // foto suelta
+    case note       // nota de texto de color
+    case frame      // viñeta de storyboard: imagen + pie de texto
+    case text       // bloque de texto sin fondo
+
+    /// Piezas cuyo texto se puede tipografiar.
+    var hasTypography: Bool { self == .text || self == .note }
+}
+
+struct BoardItem: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var kind: ItemKind
+    var x: Double
+    var y: Double
+    var w: Double
+    var h: Double
+    var z: Int = 0
+    var text: String = ""
+    var colorHex: String = "FFE9A8"
+    /// Nombre del archivo dentro de la carpeta Media (nil en notas).
+    var media: String?
+    /// Familia tipográfica del sistema (nil = fuente del sistema).
+    var fontFamily: String?
+    var fontSize: Double?
+    /// Color del texto en bloques de texto (nil = color principal del sistema).
+    var textColorHex: String?
+    /// Recorte de la foto en coordenadas normalizadas (0…1) de la imagen original; nil = entera.
+    var crop: CGRect?
+
+    var origin: CGPoint {
+        get { CGPoint(x: x, y: y) }
+        set { x = newValue.x; y = newValue.y }
+    }
+    var size: CGSize {
+        get { CGSize(width: w, height: h) }
+        set { w = max(60, newValue.width); h = max(40, newValue.height) }
+    }
+    var frameRect: CGRect {
+        get { CGRect(x: x, y: y, width: w, height: h) }
+        set { x = newValue.minX; y = newValue.minY; w = newValue.width; h = newValue.height }
+    }
+}
+
+struct Camera: Codable, Hashable {
+    var x: Double = 0
+    var y: Double = 0
+    var scale: Double = 1
+}
+
+struct Board: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var name: String
+    var createdAt = Date()
+    var items: [BoardItem] = []
+    var camera = Camera()
+    /// Última vez que se abrió; ordena los recientes del selector.
+    var openedAt: Date?
+    /// Tablero (nil, por compatibilidad) o guion de cine.
+    var kind: DocumentKind?
+    /// Líneas del guion, sólo si `kind == .script`.
+    var script: [ScriptLine]?
+
+    var isScript: Bool { kind == .script }
+
+    /// Escenas del guion (encabezados «INT./EXT.»).
+    var sceneCount: Int { script?.filter { $0.type == .scene }.count ?? 0 }
+
+    /// Siguiente valor de z para que lo nuevo quede siempre encima.
+    var topZ: Int { (items.map(\.z).max() ?? 0) + 1 }
+}
+
+/// Los documentos que se pueden crear: tableros visuales o guiones de cine.
+enum DocumentKind: String, Codable, CaseIterable {
+    case board, script
+
+    var title: String { self == .board ? "Tablero" : "Guion" }
+    var untitled: String { self == .board ? "Tablero sin título" : "Guion sin título" }
+    var icon: String { self == .board ? "square.grid.2x2" : "doc.text" }
+}
+
+/// Elementos del formato estándar de guion.
+enum ScriptElement: String, Codable, CaseIterable {
+    case scene, action, character, parenthetical, dialogue, transition
+
+    var title: String {
+        switch self {
+        case .scene: "Escena"
+        case .action: "Acción"
+        case .character: "Personaje"
+        case .parenthetical: "Acotación"
+        case .dialogue: "Diálogo"
+        case .transition: "Transición"
+        }
+    }
+
+    var placeholder: String {
+        switch self {
+        case .scene: "INT. LUGAR – DÍA"
+        case .action: "Lo que se ve y se oye…"
+        case .character: "PERSONAJE"
+        case .parenthetical: "en voz baja"
+        case .dialogue: "Lo que dice…"
+        case .transition: "CORTE A:"
+        }
+    }
+
+    /// Escena, personaje y transición se escriben siempre en mayúsculas.
+    var isUppercase: Bool { self == .scene || self == .character || self == .transition }
+
+    /// Qué elemento sigue al pulsar ↩.
+    var next: ScriptElement {
+        switch self {
+        case .scene, .action, .transition: .action
+        case .character, .parenthetical: .dialogue
+        case .dialogue: .character
+        }
+    }
+}
+
+struct ScriptLine: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var type: ScriptElement
+    var text: String = ""
+}
+
+/// Personajes y lugares que aparecen en un guion, en orden de primera aparición.
+struct ScriptIndex {
+    struct Entry: Identifiable {
+        var id: String { name }
+        let name: String
+        var count: Int
+        let firstLine: UUID
+    }
+
+    var characters: [Entry] = []
+    var places: [Entry] = []
+
+    init(_ lines: [ScriptLine]) {
+        for line in lines {
+            switch line.type {
+            case .character:
+                let name = Self.characterName(line.text)
+                if !name.isEmpty { Self.add(name, line.id, to: &characters) }
+            case .scene:
+                let place = Self.placeName(line.text)
+                if !place.isEmpty { Self.add(place, line.id, to: &places) }
+            default: break
+            }
+        }
+    }
+
+    /// «ANA (V.O.)» → «ANA».
+    static func characterName(_ text: String) -> String {
+        let base = text.components(separatedBy: "(").first ?? text
+        return base.trimmingCharacters(in: .whitespaces).uppercased()
+    }
+
+    /// «INT. CASA DE ANA – NOCHE» → «CASA DE ANA».
+    static func placeName(_ text: String) -> String {
+        var t = text.uppercased()
+        if let r = t.range(of: #"^\s*(INT\.?/EXT|INT|EXT|I/E)\.?\s*"#, options: .regularExpression) {
+            t.removeSubrange(r)
+        }
+        for separator in [" – ", " — ", " - "] {
+            if let r = t.range(of: separator) { t = String(t[..<r.lowerBound]) }
+        }
+        return t.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func add(_ name: String, _ id: UUID, to list: inout [Entry]) {
+        if let i = list.firstIndex(where: { $0.name == name }) {
+            list[i].count += 1
+        } else {
+            list.append(Entry(name: name, count: 1, firstLine: id))
+        }
+    }
+}
+
+/// Algo eliminado que todavía se puede recuperar.
+struct TrashEntry: Identifiable, Codable, Hashable {
+    enum Content: Codable, Hashable {
+        case item(BoardItem, boardID: UUID, boardName: String)
+        case board(Board)
+    }
+
+    var id = UUID()
+    var deletedAt = Date()
+    var content: Content
+}
+
+struct Library: Codable {
+    var boards: [Board]
+    var activeBoardID: UUID?
+    var trash: [TrashEntry] = []
+    /// Tableros abiertos como pestañas, en orden.
+    var openBoardIDs: [UUID] = []
+
+    static var starter: Library {
+        let board = Board(name: "Mi primer tablero")
+        return Library(boards: [board], activeBoardID: board.id, openBoardIDs: [board.id])
+    }
+}
+
+extension Library {
+    /// Decodificación tolerante: los library.json anteriores no tienen papelera.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        boards = try c.decode([Board].self, forKey: .boards)
+        activeBoardID = try c.decodeIfPresent(UUID.self, forKey: .activeBoardID)
+        trash = try c.decodeIfPresent([TrashEntry].self, forKey: .trash) ?? []
+        openBoardIDs = try c.decodeIfPresent([UUID].self, forKey: .openBoardIDs) ?? []
+    }
+}
+
+/// Paleta de las notas y de los bordes de viñeta.
+enum Palette {
+    static let colors: [String] = [
+        "FFE9A8", // amarillo papel
+        "FFC6A8", // durazno
+        "F7A8C0", // rosa
+        "C9B8FF", // lavanda
+        "A8D8FF", // azul
+        "A8F0D0", // menta
+        "E4E4EC"  // gris claro
+    ]
+
+    /// Colores para texto sin fondo.
+    static let textColors: [String] = [
+        "1C1C1E", // casi negro
+        "FFFFFF", // blanco
+        "8E8E93", // gris
+        "FF3B30", // rojo
+        "FF9500", // naranja
+        "FFCC00", // amarillo
+        "34C759", // verde
+        "007AFF", // azul
+        "AF52DE"  // violeta
+    ]
+}
+
+/// Retícula invisible a la que se imantan las piezas al moverlas.
+enum Grid {
+    static let step: Double = 10
+    /// Ancho con el que entra cada foto nueva (24 celdas).
+    static let imageWidth: Double = 240
+
+    /// Separación mínima entre piezas vecinas, tipo masonry.
+    static let gutter: Double = 10
+
+    static func snap(_ value: Double) -> Double { (value / step).rounded() * step }
+    static func snapUp(_ value: Double) -> Double { (value / step).rounded(.up) * step }
+}
