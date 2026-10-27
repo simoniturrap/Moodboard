@@ -23,6 +23,7 @@ struct ItemView: View {
             case .note:  noteCard
             case .frame: frameCard
             case .text:  textBlock
+            case .board: boardCard
             }
         }
         .overlay {
@@ -102,6 +103,40 @@ struct ItemView: View {
                 .padding(.vertical, TextMetrics.verticalInset)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
+    }
+
+    // MARK: - Carpeta: sub-tablero
+
+    private var boardCard: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 44, weight: .regular))
+                .foregroundStyle(Color.accentColor)
+            Group {
+                if isEditing {
+                    TextField("Nombre", text: Binding(get: { item.text }, set: onTextChange))
+                        .textFieldStyle(.plain)
+                        .focused($editorFocused)
+                        .onAppear(perform: focusEditor)
+                        .multilineTextAlignment(.center)
+                        .onSubmit(onEndEditing)
+                        .onExitCommand(perform: onEndEditing)
+                } else {
+                    Text(item.text.isEmpty ? "Tablero" : item.text)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .font(.system(size: 14, weight: .medium))
+            .padding(.horizontal, 10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(.regularMaterial)
+                .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+        )
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.primary.opacity(0.08)))
     }
 
     // MARK: - Viñeta de storyboard

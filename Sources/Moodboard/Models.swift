@@ -7,6 +7,7 @@ enum ItemKind: String, Codable {
     case note       // nota de texto de color
     case frame      // viñeta de storyboard: imagen + pie de texto
     case text       // bloque de texto sin fondo
+    case board      // pseudo carpeta: abre un sub-tablero propio
 
     /// Piezas cuyo texto se puede tipografiar.
     var hasTypography: Bool { self == .text || self == .note }
@@ -31,6 +32,8 @@ struct BoardItem: Identifiable, Codable, Hashable {
     var textColorHex: String?
     /// Recorte de la foto en coordenadas normalizadas (0…1) de la imagen original; nil = entera.
     var crop: CGRect?
+    /// Sub-tablero que abre esta carpeta (sólo en piezas `.board`).
+    var childBoardID: UUID?
 
     var origin: CGPoint {
         get { CGPoint(x: x, y: y) }
@@ -60,27 +63,80 @@ struct Board: Identifiable, Codable, Hashable {
     var camera = Camera()
     /// Última vez que se abrió; ordena los recientes del selector.
     var openedAt: Date?
+    /// Última vez que se editó su contenido; la lista de inicio la muestra.
+    var modifiedAt: Date?
     /// Tablero (nil, por compatibilidad) o guion de cine.
     var kind: DocumentKind?
     /// Líneas del guion, sólo si `kind == .script`.
     var script: [ScriptLine]?
+    /// Notas del gestor, sólo si `kind == .notes`.
+    var notes: [Note]?
+    /// Nota seleccionada en el gestor.
+    var activeNoteID: UUID?
+    /// Tablero padre si éste es un sub-tablero de una carpeta; nil = tablero de primer nivel.
+    var parentID: UUID?
 
     var isScript: Bool { kind == .script }
+    var isNotes: Bool { kind == .notes }
+    /// Tablero visual (los antiguos sin `kind` lo son).
+    var isBoard: Bool { (kind ?? .board) == .board }
 
     /// Escenas del guion (encabezados «INT./EXT.»).
     var sceneCount: Int { script?.filter { $0.type == .scene }.count ?? 0 }
 
+    /// Fecha que resume «última actividad» para la lista de inicio.
+    var lastModified: Date { modifiedAt ?? openedAt ?? createdAt }
+
     /// Siguiente valor de z para que lo nuevo quede siempre encima.
     var topZ: Int { (items.map(\.z).max() ?? 0) + 1 }
+
+    /// Cuenta que resume el contenido para la lista de inicio.
+    var summary: String {
+        switch kind ?? .board {
+        case .board:  return "\(items.count) elementos"
+        case .script: return "\(sceneCount) escenas"
+        case .notes:  return "\((notes ?? []).count) notas"
+        }
+    }
 }
 
-/// Los documentos que se pueden crear: tableros visuales o guiones de cine.
+/// Los documentos que se pueden crear: tableros visuales, guiones de cine o notas.
 enum DocumentKind: String, Codable, CaseIterable {
-    case board, script
+    case board, script, notes
 
-    var title: String { self == .board ? "Tablero" : "Guion" }
-    var untitled: String { self == .board ? "Tablero sin título" : "Guion sin título" }
-    var icon: String { self == .board ? "square.grid.2x2" : "doc.text" }
+    var title: String {
+        switch self {
+        case .board: "Tablero"
+        case .script: "Guion"
+        case .notes: "Notas"
+        }
+    }
+
+    var untitled: String {
+        switch self {
+        case .board: "Tablero sin título"
+        case .script: "Guion sin título"
+        case .notes: "Notas sin título"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .board: "square.grid.2x2"
+        case .script: "doc.text"
+        case .notes: "note.text"
+        }
+    }
+}
+
+/// Una nota del gestor: título y cuerpo de texto enriquecido guardado como RTF.
+struct Note: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var title: String = "Nota sin título"
+    var createdAt = Date()
+    var modifiedAt = Date()
+    /// Cuerpo en formato RTF (NSAttributedString archivado); nil = nota vacía.
+    var rtf: Data?
 }
 
 /// Elementos del formato estándar de guion.

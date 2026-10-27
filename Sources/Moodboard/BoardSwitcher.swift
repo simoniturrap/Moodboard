@@ -127,13 +127,16 @@ private struct BoardRow: View {
     let isActive: Bool
     let action: () -> Void
     @State private var isHovered = false
+    @State private var isRenaming = false
 
     var body: some View {
-        Button(action: action) {
+        Button { if !isRenaming { action() } } label: {
             HStack(spacing: 8) {
                 Image(systemName: (board.kind ?? .board).icon)
                     .foregroundStyle(.secondary)
-                Text(board.name).lineLimit(1)
+                RenamableText(text: board.name, isEditing: $isRenaming) {
+                    store.renameBoard(board.id, to: $0)
+                }
                 Spacer()
                 Text("\(board.items.count)")
                     .font(.caption)
@@ -151,6 +154,7 @@ private struct BoardRow: View {
         .buttonStyle(.plain)
         .onHover { isHovered = $0 }
         .contextMenu {
+            Button("Renombrar") { isRenaming = true }
             Button("Duplicar") { store.duplicateBoard(board.id) }
             Divider()
             Button("Eliminar", role: .destructive) { store.deleteBoard(board.id) }

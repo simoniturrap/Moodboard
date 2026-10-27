@@ -100,6 +100,8 @@ struct RootView: View {
                 HomeView()
             } else if store.activeBoard?.isScript == true {
                 ScriptEditor()
+            } else if store.activeBoard?.isNotes == true {
+                NotesView()
             } else {
                 BoardCanvas()
             }

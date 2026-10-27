@@ -42,7 +42,7 @@ struct ToolCursor: ViewModifier {
             switch tool {
             case .select: content
             case .text: content.pointerStyle(.horizontalText)
-            case .note: content.pointerStyle(.rectSelection)
+            case .note, .board: content.pointerStyle(.rectSelection)
             }
         } else {
             content
@@ -196,6 +196,7 @@ struct ToolPalette: View {
         VStack(spacing: 4) {
             button(.text, icon: "textformat", help: "Texto (T)")
             button(.note, icon: "note.text", help: "Nota (N)")
+            button(.board, icon: "folder", help: "Tablero dentro (B)")
         }
         .padding(5)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))

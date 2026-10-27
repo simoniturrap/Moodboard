@@ -99,6 +99,7 @@ struct TrashSheet: View {
             case .note:  return firstLine.isEmpty ? "Nota" : firstLine
             case .frame: return firstLine.isEmpty ? "Viñeta" : "Viñeta: " + firstLine
             case .text:  return firstLine.isEmpty ? "Texto" : firstLine
+            case .board: return firstLine.isEmpty ? "Carpeta de tableros" : "Carpeta: " + firstLine
             }
         }
     }

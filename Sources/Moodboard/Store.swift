@@ -21,7 +21,7 @@ final class Store: ObservableObject {
         didSet { if tool != .select { selection = []; editingItem = nil } }
     }
 
-    enum Tool { case select, text, note }
+    enum Tool { case select, text, note, board }
     /// Muestra la modal que pide el nombre del tablero nuevo.
     @Published var isNamingNewBoard = false
     /// Tipo de documento que propone la modal de «Nuevo…».
@@ -165,6 +165,7 @@ final class Store: ObservableObject {
     func mutateBoard(_ change: (inout Board) -> Void) {
         guard let i = activeIndex else { return }
         change(&library.boards[i])
+        library.boards[i].modifiedAt = Date()
         scheduleSave()
     }
 
@@ -173,9 +174,12 @@ final class Store: ObservableObject {
         library.openBoardIDs.compactMap { id in library.boards.first { $0.id == id } }
     }
 
-    /// Todos los tableros, del abierto más recientemente al más antiguo.
+    /// Proyectos de primer nivel, del abierto más recientemente al más antiguo.
+    /// Los sub-tableros de una carpeta no aparecen aquí: se abren desde su carpeta.
     var recentBoards: [Board] {
-        library.boards.sorted { ($0.openedAt ?? $0.createdAt) > ($1.openedAt ?? $1.createdAt) }
+        library.boards
+            .filter { $0.parentID == nil }
+            .sorted { ($0.openedAt ?? $0.createdAt) > ($1.openedAt ?? $1.createdAt) }
     }
 
     /// Abre la modal de creación con el tipo ya elegido.
@@ -186,13 +190,27 @@ final class Store: ObservableObject {
 
     func newBoard(named name: String = "Tablero sin título", kind: DocumentKind = .board) {
         checkpoint()
+        library.boards.append(makeBoard(named: name, kind: kind))
+        select(board: library.boards.last!.id)
+    }
+
+    /// Construye un tablero vacío del tipo dado, con su contenido inicial.
+    private func makeBoard(named name: String, kind: DocumentKind, parentID: UUID? = nil) -> Board {
         var board = Board(name: name)
-        if kind == .script {
+        board.parentID = parentID
+        switch kind {
+        case .board:
+            board.kind = .board
+        case .script:
             board.kind = .script
             board.script = [ScriptLine(type: .scene)]
+        case .notes:
+            board.kind = .notes
+            let first = Note()
+            board.notes = [first]
+            board.activeNoteID = first.id
         }
-        library.boards.append(board)
-        select(board: board.id)
+        return board
     }
 
     // MARK: - Guion
@@ -295,20 +313,160 @@ final class Store: ObservableObject {
     }
 
 
+    // MARK: - Notas
+
+    var notes: [Note] { activeBoard?.notes ?? [] }
+
+    var activeNote: Note? {
+        guard let id = activeBoard?.activeNoteID else { return notes.first }
+        return notes.first { $0.id == id } ?? notes.first
+    }
+
+    private func mutateNotes(_ change: (inout [Note]) -> Void) {
+        mutateBoard { board in
+            var list = board.notes ?? []
+            change(&list)
+            board.notes = list
+        }
+    }
+
+    func selectNote(_ id: UUID) {
+        mutateBoard { $0.activeNoteID = id }
+    }
+
+    func addNote() {
+        checkpoint()
+        let note = Note()
+        mutateNotes { $0.insert(note, at: 0) }
+        mutateBoard { $0.activeNoteID = note.id }
+    }
+
+    func renameNote(_ id: UUID, to title: String) {
+        checkpoint(coalescing: "note-title-\(id)")
+        mutateNotes { notes in
+            guard let i = notes.firstIndex(where: { $0.id == id }) else { return }
+            notes[i].title = title
+            notes[i].modifiedAt = Date()
+        }
+    }
+
+    func deleteNote(_ id: UUID) {
+        checkpoint()
+        mutateNotes { $0.removeAll { $0.id == id } }
+        // El gestor nunca queda sin notas; si era la activa, pasa a la primera.
+        mutateBoard { board in
+            if (board.notes ?? []).isEmpty {
+                let note = Note()
+                board.notes = [note]
+                board.activeNoteID = note.id
+            } else if board.activeNoteID == id {
+                board.activeNoteID = board.notes?.first?.id
+            }
+        }
+    }
+
+    /// Guarda el cuerpo de una nota. La escritura cuenta como un solo paso de deshacer por nota.
+    func updateNoteBody(_ id: UUID, rtf: Data) {
+        if textUndoItem != id {
+            checkpoint()
+            textUndoItem = id
+        }
+        mutateNotes { notes in
+            guard let i = notes.firstIndex(where: { $0.id == id }) else { return }
+            notes[i].rtf = rtf
+            notes[i].modifiedAt = Date()
+        }
+    }
+
+    // MARK: - Carpetas de tableros
+
+    /// Coloca una carpeta en el tablero: crea un sub-tablero vacío y la pieza que lo abre.
+    func addBoardFolder(at point: CGPoint) {
+        guard let parent = activeBoard else { return }
+        checkpoint()
+        let child = makeBoard(named: "Tablero sin título", kind: .board, parentID: parent.id)
+        library.boards.append(child)
+        var item = BoardItem(kind: .board,
+                             x: Grid.snap(point.x - 70), y: Grid.snap(point.y - 70),
+                             w: 140, h: 140, text: child.name)
+        item.childBoardID = child.id
+        mutateBoard { board in
+            item.z = board.topZ
+            board.items.append(item)
+        }
+        selection = [item.id]
+        editingItem = item.id
+    }
+
+    /// Doble clic en una carpeta: abre su sub-tablero como pestaña.
+    func openBoardFolder(_ item: BoardItem) {
+        guard let child = item.childBoardID, library.boards.contains(where: { $0.id == child }) else { return }
+        select(board: child)
+    }
+
+    /// Cadena de carpetas padre de un tablero, de la raíz a su contenedor directo (para las migas de pan).
+    func ancestors(of id: UUID) -> [Board] {
+        var chain: [Board] = []
+        var current = library.boards.first { $0.id == id }?.parentID
+        while let pid = current, let board = library.boards.first(where: { $0.id == pid }) {
+            chain.insert(board, at: 0)
+            current = board.parentID
+        }
+        return chain
+    }
+
+    /// Este tablero y todos sus descendientes (carpetas anidadas), por si hay que borrarlos juntos.
+    private func descendantBoardIDs(of ids: Set<UUID>) -> Set<UUID> {
+        var result = ids
+        var queue = Array(ids)
+        while let current = queue.popLast() {
+            for child in library.boards where child.parentID == current && !result.contains(child.id) {
+                result.insert(child.id)
+                queue.append(child.id)
+            }
+        }
+        return result
+    }
+
+    /// Borra tableros y todo lo que cuelga de ellos, cerrando sus pestañas.
+    private func removeBoardSubtrees(_ roots: Set<UUID>) {
+        let all = descendantBoardIDs(of: roots)
+        library.openBoardIDs.removeAll { all.contains($0) }
+        if let active = library.activeBoardID, all.contains(active) { library.activeBoardID = nil }
+        library.boards.removeAll { all.contains($0.id) }
+    }
+
     func duplicateBoard(_ id: UUID) {
         checkpoint()
-        guard let source = library.boards.first(where: { $0.id == id }) else { return }
+        let parent = library.boards.first { $0.id == id }?.parentID
+        guard let newID = cloneBoardTree(id, parentID: parent, rename: true) else { return }
+        select(board: newID)
+    }
+
+    /// Clona un tablero y, recursivamente, los sub-tableros de sus carpetas (ids nuevos).
+    @discardableResult
+    private func cloneBoardTree(_ id: UUID, parentID: UUID?, rename: Bool) -> UUID? {
+        guard let source = library.boards.first(where: { $0.id == id }) else { return nil }
         var copy = source
         copy.id = UUID()
-        copy.name = source.name + " copia"
+        copy.parentID = parentID
         copy.createdAt = Date()
+        copy.openedAt = nil
+        if rename { copy.name = source.name + " copia" }
         copy.items = source.items.map { item in
             var c = item
             c.id = UUID()
             return c
         }
         library.boards.append(copy)
-        select(board: copy.id)
+        for idx in copy.items.indices where copy.items[idx].kind == .board {
+            guard let childID = copy.items[idx].childBoardID,
+                  let newChild = cloneBoardTree(childID, parentID: copy.id, rename: false) else { continue }
+            if let bi = library.boards.firstIndex(where: { $0.id == copy.id }) {
+                library.boards[bi].items[idx].childBoardID = newChild
+            }
+        }
+        return copy.id
     }
 
     func deleteBoard(_ id: UUID) {
@@ -316,7 +474,7 @@ final class Store: ObservableObject {
         checkpoint()
         moveToTrash([TrashEntry(content: .board(board))])
         closeTab(id)
-        library.boards.removeAll { $0.id == id }
+        removeBoardSubtrees([id])   // el tablero y sus sub-tableros se van juntos
         selection = []
         scheduleSave()
     }
@@ -325,6 +483,7 @@ final class Store: ObservableObject {
         guard let i = library.boards.firstIndex(where: { $0.id == id }) else { return }
         checkpoint()
         library.boards[i].name = name
+        library.boards[i].modifiedAt = Date()
         scheduleSave()
     }
 
@@ -392,12 +551,16 @@ final class Store: ObservableObject {
         let ids = selection
         guard !ids.isEmpty, let board = activeBoard else { return }
         checkpoint()
+        let removed = board.items.filter { ids.contains($0.id) }
         if toTrash {
-            moveToTrash(board.items.filter { ids.contains($0.id) }.map {
+            moveToTrash(removed.map {
                 TrashEntry(content: .item($0, boardID: board.id, boardName: board.name))
             })
         }
         mutateBoard { $0.items.removeAll { ids.contains($0.id) } }
+        // Las carpetas se llevan sus sub-tableros.
+        let childRoots = Set(removed.compactMap { $0.kind == .board ? $0.childBoardID : nil })
+        if !childRoots.isEmpty { removeBoardSubtrees(childRoots) }
         selection = []
         editingItem = nil
     }
@@ -452,6 +615,12 @@ final class Store: ObservableObject {
             textUndoItem = id
         }
         update(id) { $0.text = text }
+        // Renombrar una carpeta renombra su sub-tablero.
+        if let item = activeBoard?.items.first(where: { $0.id == id }), item.kind == .board,
+           let child = item.childBoardID,
+           let bi = library.boards.firstIndex(where: { $0.id == child }) {
+            library.boards[bi].name = text
+        }
         refitTextHeights([id])
     }
 
@@ -485,7 +654,7 @@ final class Store: ObservableObject {
                 switch board.items[i].kind {
                 case .text: board.items[i].textColorHex = hex
                 case .note, .frame: board.items[i].colorHex = hex
-                case .image: break
+                case .image, .board: break
                 }
             }
         }

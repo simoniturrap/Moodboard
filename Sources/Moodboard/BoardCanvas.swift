@@ -102,7 +102,11 @@ struct BoardCanvas: View {
                 isHandHeld = false   // si se cambia de ventana con el espacio pulsado, no queda la mano pegada
             }
             .overlay(alignment: .topLeading) {
-                BoardSwitcher().padding(20)
+                VStack(alignment: .leading, spacing: 10) {
+                    BoardSwitcher()
+                    breadcrumb
+                }
+                .padding(20)
             }
             .overlay(alignment: .bottomLeading) {
                 TrashButton().padding(20)
@@ -159,12 +163,27 @@ struct BoardCanvas: View {
         .toolbar { toolbarItems }
     }
 
+    /// Sólo las piezas cercanas a lo que se ve: con muchas imágenes, dibujar las de fuera
+    /// de pantalla hacía el desplazamiento y el zoom más pesados. El margen (medio viewport)
+    /// las deja listas antes de entrar, para que no aparezcan de golpe al desplazarse.
+    private var visibleItems: [BoardItem] {
+        let all = (board?.items ?? []).sorted { $0.z < $1.z }
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return all }
+        let origin = toWorld(.zero)
+        let visible = CGRect(x: origin.x, y: origin.y,
+                             width: viewportSize.width / scale, height: viewportSize.height / scale)
+        let margin = max(visible.width, visible.height) * 0.5
+        let reach = visible.insetBy(dx: -margin, dy: -margin)
+        return all.filter { reach.intersects($0.frameRect) }
+    }
+
     private var content: some View {
         ZStack(alignment: .topLeading) {
-            ForEach((board?.items ?? []).sorted { $0.z < $1.z }) { item in
+            ForEach(visibleItems) { item in
+                let isSelected = store.selection.contains(item.id)
                 ItemView(item: item,
                          scale: scale,
-                         isSelected: store.selection.contains(item.id),
+                         isSelected: isSelected,
                          isEditing: store.editingItem == item.id,
                          onTextChange: { store.updateText(item.id, $0) },
                          onEndEditing: { store.editingItem = nil })
@@ -172,19 +191,27 @@ struct BoardCanvas: View {
                     .gesture(itemDrag(item))
                     .simultaneousGesture(TapGesture().onEnded { select(item) })
                     .simultaneousGesture(TapGesture(count: 2).onEnded {
-                        if item.kind == .image {
+                        switch item.kind {
+                        case .image:
                             withAnimation(.spring(duration: 0.3, bounce: 0.12)) { store.lightboxItem = item.id }
-                        } else {
+                        case .board:
+                            store.openBoardFolder(item)
+                        default:
                             store.editingItem = item.id
                         }
                     })
                     .contextMenu {
                         if item.kind == .image { imageMenu(item) }
+                        if item.kind == .board { boardMenu(item) }
                     }
                     .overlay {
-                        ForEach(Corner.allCases, id: \.self) { corner in
-                            ResizeHandle(corner: corner, scale: scale)
-                                .gesture(resizeDrag(item, from: corner))
+                        // Las asas de redimensionar sólo en lo seleccionado: antes había 4 por pieza
+                        // (cada una con su gesto y seguimiento del cursor) aunque no estuviera elegida.
+                        if isSelected {
+                            ForEach(Corner.allCases, id: \.self) { corner in
+                                ResizeHandle(corner: corner, scale: scale)
+                                    .gesture(resizeDrag(item, from: corner))
+                            }
                         }
                     }
                     .offset(x: item.x, y: item.y)
@@ -192,6 +219,31 @@ struct BoardCanvas: View {
         }
         .scaleEffect(scale, anchor: .topLeading)
         .offset(x: camera.x, y: camera.y)
+    }
+
+    /// Ruta de carpetas hasta el sub-tablero abierto; cada eslabón vuelve a su nivel.
+    @ViewBuilder
+    private var breadcrumb: some View {
+        if let board, !store.ancestors(of: board.id).isEmpty {
+            let chain = store.ancestors(of: board.id)
+            HStack(spacing: 4) {
+                ForEach(chain) { ancestor in
+                    Button { store.select(board: ancestor.id) } label: {
+                        Text(ancestor.name).lineLimit(1)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    Image(systemName: "chevron.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+                Text(board.name).lineLimit(1).fontWeight(.medium)
+            }
+            .font(.system(size: 12))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(.regularMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.primary.opacity(0.1)))
+            .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+        }
     }
 
     private var hint: some View {
@@ -356,6 +408,16 @@ struct BoardCanvas: View {
         Button("Descargar…") { store.downloadImage(item.id) }
     }
 
+    /// Clic derecho sobre una carpeta: abrir el sub-tablero o renombrarla.
+    @ViewBuilder
+    private func boardMenu(_ item: BoardItem) -> some View {
+        Button("Abrir") { store.openBoardFolder(item) }
+        Button("Renombrar") { store.selection = [item.id]; store.editingItem = item.id }
+        Divider()
+        Button("Duplicar") { target(item); store.duplicateSelection() }
+        Button("Eliminar", role: .destructive) { target(item); store.deleteSelection() }
+    }
+
     private func target(_ item: BoardItem) {
         store.focusArea = .canvas
         if !store.selection.contains(item.id) { store.selection = [item.id] }
@@ -416,6 +478,8 @@ struct BoardCanvas: View {
                 store.tool = store.tool == .text ? .select : .text
             case "n":
                 store.tool = store.tool == .note ? .select : .note
+            case "b":
+                store.tool = store.tool == .board ? .select : .board
             default:
                 return false
             }
@@ -428,13 +492,18 @@ struct BoardCanvas: View {
     /// Con Texto o Nota activas, el clic en el fondo crea la pieza y empieza a escribir.
     private func placeWithTool(at location: CGPoint) -> Bool {
         let point = toWorld(location)
+        store.focusArea = .canvas
         let item: BoardItem
         switch store.tool {
         case .select: return false
+        case .board:
+            // La carpeta crea además su sub-tablero; addBoardFolder deja la pieza en edición.
+            store.addBoardFolder(at: point)
+            store.tool = .select
+            return true
         case .text: item = store.textItem(at: point)
         case .note: item = store.noteItem(at: point)
         }
-        store.focusArea = .canvas
         store.add(item)
         store.editingItem = item.id
         store.tool = .select
