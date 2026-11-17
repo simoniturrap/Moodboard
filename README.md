@@ -74,6 +74,17 @@ El editor es una hoja con formato estándar (carta, Courier 12, márgenes de 1,5
 
 **Exportar PDF** pagina el guion: portada con el título y páginas numeradas desde la 2.
 
+## Sincronización y compartir
+
+La app funciona en local sin configurar nada. Si querés sincronizar entre
+dispositivos y compartir tableros por enlace, desplegás el Worker de Cloudflare
+(D1 + R2) que está en [`server/`](server/README.md) y cargás la URL y el token en
+**Ajustes → Sincronización**. El token se guarda en el Keychain; no hay ningún
+secreto en el repositorio.
+
+Un tablero compartido genera un enlace público de sólo lectura que se ve en vivo
+desde el navegador, sin necesidad de la app ni del token.
+
 ## Dónde viven los datos
 
 `~/Library/Application Support/Moodboard/`
@@ -81,3 +92,7 @@ El editor es una hoja con formato estándar (carta, Courier 12, márgenes de 1,5
 - `Media/` — copia de cada imagen que agregás (el original no se toca ni se mueve)
 
 El guardado es automático, con medio segundo de retraso para no escribir en cada pixel arrastrado.
+
+## Licencia
+
+[MIT](LICENSE) — © 2026 Simón Iturra
