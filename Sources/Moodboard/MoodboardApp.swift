@@ -4,12 +4,14 @@ import AppKit
 @main
 struct MoodboardApp: App {
     @StateObject private var store = Store()
+    @AppStorage(themePreferenceKey) private var theme = ThemePreference.system.rawValue
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .environmentObject(store)
                 .frame(minWidth: 900, minHeight: 600)
+                .preferredColorScheme((ThemePreference(rawValue: theme) ?? .system).colorScheme)
                 .onDisappear { store.saveNow() }
         }
         .windowToolbarStyle(.unified)
@@ -26,6 +28,9 @@ struct MoodboardApp: App {
             CommandMenu("Tableros") {
                 Button("Inicio") { store.goHome() }
                     .keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("Compartir tablero…") { store.shareActiveBoard() }
+                    .disabled(!store.canShareActiveBoard)
+                Button("Sincronización…") { store.isShowingSync = true }
                 Divider()
                 // ⌘1…⌘8 para las primeras pestañas; ⌘9 siempre para la última.
                 ForEach(Array(store.openBoards.prefix(8).enumerated()), id: \.element.id) { index, board in
@@ -41,6 +46,12 @@ struct MoodboardApp: App {
                     .keyboardShortcut("]", modifiers: [.command, .shift])
                 Button("Pestaña anterior") { store.selectAdjacentTab(-1) }
                     .keyboardShortcut("[", modifiers: [.command, .shift])
+            }
+            // El ítem de Preferencias se declara a mano (SettingsLink) para que aparezca siempre,
+            // también en el .app empaquetado, donde el ítem automático de la escena Settings no sale.
+            CommandGroup(replacing: .appSettings) {
+                SettingsLink { Text("Preferencias…") }
+                    .keyboardShortcut(",", modifiers: .command)
             }
             CommandGroup(replacing: .undoRedo) {
                 Button("Deshacer") { undo() }
@@ -64,6 +75,10 @@ struct MoodboardApp: App {
                 Button("Eliminar selección") { store.deleteSelection() }
                 Button("Papelera…") { store.isShowingTrash = true }
             }
+        }
+
+        Settings {
+            PreferencesView()
         }
     }
 
@@ -116,5 +131,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $store.isNamingNewBoard) { NewBoardSheet() }
         .sheet(isPresented: $store.isShowingTrash) { TrashSheet() }
+        .sheet(isPresented: $store.isShowingSync) { SyncSettingsSheet() }
+        .sheet(isPresented: $store.isShowingShare) { ShareSheet() }
     }
 }

@@ -1,0 +1,27 @@
+{
+  // Worker de sincronización de Moodboard.
+  // Antes de desplegar, reemplaza los `database_id` con los que devuelva
+  //   npx wrangler d1 create moodboard
+  // y crea el bucket con
+  //   npx wrangler r2 bucket create moodboard-media
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "moodboard-sync",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "observability": { "enabled": true },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "moodboard",
+      "database_id": "dabde95e-d326-4efb-962b-c3b3f87c7a88"
+    }
+  ],
+
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "moodboard-media"
+    }
+  ]
+}

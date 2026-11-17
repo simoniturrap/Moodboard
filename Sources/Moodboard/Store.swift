@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import ImageIO
 
 /// Fuente de verdad de la app: tableros en memoria, JSON + imágenes en disco.
 @MainActor
@@ -15,18 +16,19 @@ final class Store: ObservableObject {
             if let old = oldValue { discardIfEmptyText(old) }
         }
     }
-    /// Herramienta activa de la paleta derecha.
-    @Published var tool: Tool = .select {
-        // Al tomar una herramienta se suelta la selección para que vuelva la paleta.
-        didSet { if tool != .select { selection = []; editingItem = nil } }
-    }
-
-    enum Tool { case select, text, note, board }
     /// Muestra la modal que pide el nombre del tablero nuevo.
     @Published var isNamingNewBoard = false
     /// Tipo de documento que propone la modal de «Nuevo…».
     @Published var newDocumentKind: DocumentKind = .board
     @Published var isShowingTrash = false
+    /// Modal de ajustes de sincronización con el servidor.
+    @Published var isShowingSync = false
+    /// Hoja de "Compartir tablero" con el enlace público.
+    @Published var isShowingShare = false
+    /// Enlace público del tablero activo (nil mientras se prepara o si no está compartido).
+    @Published var shareURL: URL?
+    /// true mientras se sube el tablero al servidor y se pide el enlace.
+    @Published var isPreparingShare = false
     /// Desplegable de tableros recientes (botón flotante de arriba a la izquierda).
     @Published var isBoardMenuOpen = false
     /// Tablero recién abierto cuyo encuadre debe recolocar el lienzo (necesita el tamaño de la vista).
@@ -71,12 +73,22 @@ final class Store: ObservableObject {
 
     // MARK: - Ciclo de vida
 
+    /// Sincronización con el servidor (Cloudflare). Local-first: la app no depende de la red.
+    let sync = SyncService.shared
+
+    /// true si `library` se leyó de verdad del disco; false si es el starter de relleno (archivo
+    /// ausente o ilegible). Nunca subimos ni fusionamos un starter de relleno: así un arranque sin
+    /// datos locales no puede pisar lo que el servidor sí tenga.
+    private let loadedFromDisk: Bool
+
     init() {
         if let data = try? Data(contentsOf: Store.libraryFile),
            let decoded = try? JSONDecoder().decode(Library.self, from: data) {
             library = decoded
+            loadedFromDisk = true
         } else {
             library = .starter
+            loadedFromDisk = false
         }
         // Sin tablero activo (se cerraron todas las pestañas) la app abre en la vista de inicio.
         library.trash.removeAll { $0.deletedAt.timeIntervalSinceNow < -trashMaxAge }
@@ -88,6 +100,130 @@ final class Store: ObservableObject {
         }
         // Al abrir la app, el tablero activo se muestra desde su esquina superior izquierda.
         boardToFrame = library.activeBoardID
+
+        // El servidor puede adoptar un documento más nuevo que el local.
+        sync.applyRemoteLibrary = { [weak self] remote in self?.adoptRemoteLibrary(remote) }
+        // Al llegar una imagen del servidor, redibujar las vistas (que observan el Store).
+        sync.onMediaArrived = { [weak self] in self?.objectWillChange.send() }
+        Task { await bootstrapSync() }
+    }
+
+    // MARK: - Sincronización
+
+    /// Sincroniza bajo demanda (p. ej. tras configurar el servidor en los ajustes).
+    func resync() async { await bootstrapSync() }
+
+    // MARK: - Compartir
+
+    /// Tablero visual (no carpeta) con contenido: lo único que se puede compartir por ahora.
+    var canShareActiveBoard: Bool {
+        guard let board = activeBoard else { return false }
+        return board.isBoard && !board.items.isEmpty
+    }
+
+    /// Publica el tablero activo y abre la hoja con el enlace público (en vivo).
+    /// Si el servidor no está configurado, lleva a los ajustes de sincronización.
+    func shareActiveBoard() {
+        guard let board = activeBoard, board.isBoard else { return }
+        guard SyncConfig.isConfigured else { isShowingSync = true; return }
+        shareURL = nil
+        isPreparingShare = true
+        isShowingShare = true
+        let id = board.id
+        let media = board.items.compactMap(\.media)
+        Task {
+            await sync.pushNow(library)                 // garantiza que el servidor tiene la última versión
+            for name in media { await sync.uploadMedia(name) }
+            if let token = await sync.share(boardID: id) {
+                shareURL = SyncConfig.publicURL(token: token)
+            }
+            isPreparingShare = false
+        }
+    }
+
+    /// Marca (o desmarca) una foto como portada del enlace compartido.
+    func setCover(_ id: UUID) {
+        guard let media = activeBoard?.items.first(where: { $0.id == id })?.media else { return }
+        checkpoint()
+        mutateBoard { $0.cover = ($0.cover == media) ? nil : media }
+    }
+
+    /// true si esta foto es la portada actual del tablero.
+    func isCover(_ id: UUID) -> Bool {
+        guard let item = activeBoard?.items.first(where: { $0.id == id }) else { return false }
+        return item.media != nil && item.media == activeBoard?.cover
+    }
+
+    /// Revoca el enlace del tablero activo.
+    func unshareActiveBoard() {
+        guard let id = activeBoard?.id else { return }
+        Task { await sync.unshare(boardID: id) }
+        shareURL = nil
+        isShowingShare = false
+    }
+
+    /// Al abrir: baja lo que haya en el servidor y lo **une** con lo local, para que ninguna de las
+    /// dos partes pueda borrar tableros de la otra. Nunca se adopta un remoto a ciegas (eso era lo
+    /// que, con un servidor vacío a una revisión mayor, borraba todo el contenido). Luego concilia
+    /// las imágenes.
+    private func bootstrapSync() async {
+        guard SyncConfig.isConfigured else { return }
+        if let (remote, revision) = await sync.pull() {
+            if loadedFromDisk {
+                // Disco + servidor se funden; subimos la unión para que el servidor quede igual.
+                installFromSync(library.merged(with: remote), revision: revision, pushBack: true)
+            } else {
+                // Sin datos locales fiables (archivo ausente o ilegible): manda el servidor, y no
+                // aportamos el tablero de relleno del arranque ni lo subimos.
+                installFromSync(remote, revision: revision, pushBack: false)
+            }
+        } else if loadedFromDisk {
+            // Servidor vacío (404) y sí tenemos datos reales: suben como primera revisión.
+            // Si lo local fuese sólo el starter de relleno, no subimos nada: no pisamos el servidor.
+            await sync.pushNow(library)
+        }
+        await sync.refreshUsage()   // conoce la cuota antes de reconciliar (para el freno de subidas)
+        await sync.reconcile(referenced: SyncService.referencedMedia(library))
+    }
+
+    /// Instala una biblioteca venida del servidor (ya fusionada o adoptada tal cual), la guarda en
+    /// disco y, si procede, sube el resultado para que el servidor quede con la misma versión.
+    /// Deja antes una copia de seguridad sólo si cambió el conjunto de tableros (evita basura).
+    private func installFromSync(_ newLibrary: Library, revision: Int, pushBack: Bool) {
+        let changed = Set(newLibrary.boards.map(\.id)) != Set(library.boards.map(\.id))
+        if changed { backupLocalLibrary() }
+        library = newLibrary
+        SyncConfig.knownRevision = revision
+        let existing = Set(library.boards.map(\.id))
+        library.openBoardIDs = library.openBoardIDs.filter(existing.contains)
+        if let active = library.activeBoardID, !existing.contains(active) { library.activeBoardID = nil }
+        selection = []
+        editingItem = nil
+        saveLocalOnly()
+        if pushBack { Task { await sync.pushNow(library) } }
+    }
+
+    /// Un documento que llega del servidor en caliente se **une** al local (nunca lo reemplaza a
+    /// ciegas), conservando lo que el usuario está viendo.
+    private func adoptRemoteLibrary(_ remote: Library) {
+        installFromSync(library.merged(with: remote), revision: SyncConfig.knownRevision, pushBack: false)
+        Task { await sync.reconcile(referenced: SyncService.referencedMedia(library)) }
+    }
+
+    /// Copia de respaldo del library.json actual antes de sobrescribirlo con el remoto.
+    private func backupLocalLibrary() {
+        guard let data = try? JSONEncoder().encode(library) else { return }
+        let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "library.prelaunch-sync-\(f.string(from: Date())).json"
+        try? data.write(to: Store.root.appendingPathComponent(name))
+    }
+
+    /// Guarda solo en disco, sin re-empujar al servidor (para no entrar en bucle al adoptar remoto).
+    private func saveLocalOnly() {
+        guard let data = try? JSONEncoder().encode(library) else { return }
+        let tmp = Store.root.appendingPathComponent("library.json.tmp")
+        try? data.write(to: tmp)
+        _ = try? FileManager.default.replaceItemAt(Store.libraryFile, withItemAt: tmp)
     }
 
     // MARK: - Deshacer
@@ -148,6 +284,7 @@ final class Store: ObservableObject {
         let tmp = Store.root.appendingPathComponent("library.json.tmp")
         try? data.write(to: tmp)
         _ = try? FileManager.default.replaceItemAt(Store.libraryFile, withItemAt: tmp)
+        sync.schedulePush(library)
     }
 
     // MARK: - Tableros
@@ -453,9 +590,14 @@ final class Store: ObservableObject {
         copy.createdAt = Date()
         copy.openedAt = nil
         if rename { copy.name = source.name + " copia" }
+        // Ids nuevos para cada pieza, reapuntando los hijos de las columnas a las copias.
+        let idMap = Dictionary(uniqueKeysWithValues: source.items.map { ($0.id, UUID()) })
         copy.items = source.items.map { item in
             var c = item
-            c.id = UUID()
+            c.id = idMap[item.id] ?? UUID()
+            if c.kind == .column, let kids = item.children {
+                c.children = kids.compactMap { idMap[$0] }
+            }
             return c
         }
         library.boards.append(copy)
@@ -551,13 +693,23 @@ final class Store: ObservableObject {
         let ids = selection
         guard !ids.isEmpty, let board = activeBoard else { return }
         checkpoint()
-        let removed = board.items.filter { ids.contains($0.id) }
+        // Las columnas eliminadas devuelven su contenido al lienzo (no se pierde al borrar el organizador).
+        for column in board.items where ids.contains(column.id) && column.kind == .column {
+            releaseColumn(column.id)
+        }
+        let removed = (activeBoard ?? board).items.filter { ids.contains($0.id) }
         if toTrash {
             moveToTrash(removed.map {
                 TrashEntry(content: .item($0, boardID: board.id, boardName: board.name))
             })
         }
-        mutateBoard { $0.items.removeAll { ids.contains($0.id) } }
+        mutateBoard { board in
+            board.items.removeAll { ids.contains($0.id) }
+            // Si lo borrado estaba dentro de una columna, quita también la referencia (no quedan ids colgando).
+            for i in board.items.indices { board.items[i].children?.removeAll { ids.contains($0) } }
+        }
+        // Reajusta el alto de las columnas que hayan perdido contenido.
+        for column in (activeBoard?.items ?? []) where column.kind == .column { refitColumnHeight(column.id) }
         // Las carpetas se llevan sus sub-tableros.
         let childRoots = Set(removed.compactMap { $0.kind == .board ? $0.childBoardID : nil })
         if !childRoots.isEmpty { removeBoardSubtrees(childRoots) }
@@ -570,14 +722,25 @@ final class Store: ObservableObject {
         checkpoint()
         var newIDs: Set<UUID> = []
         mutateBoard { board in
-            let copies = board.items.filter { selection.contains($0.id) }.map { item -> BoardItem in
+            var copies: [BoardItem] = []
+            var z = board.topZ
+            for item in board.items where selection.contains(item.id) {
                 var c = item
                 c.id = UUID()
                 c.x += 28
                 c.y += 28
-                c.z = board.topZ
+                c.z = z; z += 1
+                // Una columna duplicada se lleva copias de su contenido, no referencias al original.
+                if c.kind == .column, let kids = item.children {
+                    c.children = kids.compactMap { kidID in
+                        guard var kid = board.items.first(where: { $0.id == kidID }) else { return nil }
+                        kid.id = UUID()
+                        copies.append(kid)
+                        return kid.id
+                    }
+                }
                 newIDs.insert(c.id)
-                return c
+                copies.append(c)
             }
             board.items.append(contentsOf: copies)
         }
@@ -590,13 +753,21 @@ final class Store: ObservableObject {
         var map: [UUID: UUID] = [:]
         mutateBoard { board in
             var z = board.topZ
-            let copies = board.items.filter { ids.contains($0.id) }.map { item -> BoardItem in
+            var copies: [BoardItem] = []
+            for item in board.items where ids.contains(item.id) {
                 var c = item
                 c.id = UUID()
-                c.z = z
-                z += 1
+                c.z = z; z += 1
+                if c.kind == .column, let kids = item.children {
+                    c.children = kids.compactMap { kidID in
+                        guard var kid = board.items.first(where: { $0.id == kidID }) else { return nil }
+                        kid.id = UUID()
+                        copies.append(kid)
+                        return kid.id
+                    }
+                }
                 map[item.id] = c.id
-                return c
+                copies.append(c)
             }
             board.items.append(contentsOf: copies)
         }
@@ -654,7 +825,7 @@ final class Store: ObservableObject {
                 switch board.items[i].kind {
                 case .text: board.items[i].textColorHex = hex
                 case .note, .frame: board.items[i].colorHex = hex
-                case .image, .board: break
+                case .image, .board, .column: break
                 }
             }
         }
@@ -778,14 +949,20 @@ final class Store: ObservableObject {
     private var pasteCount = 0
 
     func selectAll() {
-        selection = Set(activeBoard?.items.map(\.id) ?? [])
+        let claimed = claimedItemIDs
+        selection = Set((activeBoard?.items ?? []).map(\.id).filter { !claimed.contains($0) })
         editingItem = nil
     }
 
     /// Copia la selección: piezas para esta app, y además imagen y texto para otras apps.
     func copySelection() {
         guard let board = activeBoard else { return }
-        let items = board.items.filter { selection.contains($0.id) }.sorted { $0.z < $1.z }
+        // Al copiar una columna se copia también su contenido, para que llegue completa al pegar.
+        var included = selection
+        for item in board.items where selection.contains(item.id) && item.kind == .column {
+            included.formUnion(item.children ?? [])
+        }
+        let items = board.items.filter { included.contains($0.id) }.sorted { $0.z < $1.z }
         guard !items.isEmpty, let data = try? JSONEncoder().encode(items) else { return }
 
         let entry = NSPasteboardItem()
@@ -835,21 +1012,28 @@ final class Store: ObservableObject {
             dy += Grid.snap(visibleWorldRect.midY - bounds.midY)
         }
         checkpoint()
-        var ids: Set<UUID> = []
+        // Ids nuevos para todas las piezas; las columnas conservan su contenido reapuntando a las copias.
+        let idMap = Dictionary(uniqueKeysWithValues: items.map { ($0.id, UUID()) })
+        let claimed = Set(items.flatMap { $0.children ?? [] }.compactMap { idMap[$0] })
+        var topLevel: Set<UUID> = []
         mutateBoard { board in
             var z = board.topZ
             for var item in items {
-                item.id = UUID()
+                let newID = idMap[item.id] ?? UUID()
+                item.id = newID
                 item.x += dx
                 item.y += dy
                 item.z = z
                 z += 1
-                ids.insert(item.id)
+                if item.kind == .column, let kids = item.children {
+                    item.children = kids.compactMap { idMap[$0] }
+                }
+                if !claimed.contains(newID) { topLevel.insert(newID) }
                 board.items.append(item)
             }
         }
         editingItem = nil
-        selection = ids
+        selection = topLevel
         focusArea = .canvas
     }
 
@@ -882,18 +1066,106 @@ final class Store: ObservableObject {
     }
 
     func deletePermanently(_ entryID: UUID) {
+        guard let entry = library.trash.first(where: { $0.id == entryID }) else { return }
         checkpoint()
+        let candidates = Self.mediaNames(in: entry)
         library.trash.removeAll { $0.id == entryID }
+        purgeOrphanMedia(candidates)
         scheduleSave()
     }
 
     func emptyTrash() {
         checkpoint()
+        let candidates = library.trash.reduce(into: Set<String>()) { $0.formUnion(Self.mediaNames(in: $1)) }
         library.trash.removeAll()
+        purgeOrphanMedia(candidates)
         scheduleSave()
     }
 
+    /// Nombres de archivo de imagen que usa una entrada de la papelera.
+    private static func mediaNames(in entry: TrashEntry) -> Set<String> {
+        switch entry.content {
+        case .board(let b):             return Set(b.items.compactMap(\.media))
+        case .item(let item, _, _):     return item.media.map { [$0] } ?? []
+        }
+    }
+
+    /// Borra del disco y del servidor las imágenes candidatas que ya no use ninguna
+    /// otra parte de la biblioteca (tableros u otras entradas de la papelera).
+    private func purgeOrphanMedia(_ candidates: Set<String>) {
+        guard !candidates.isEmpty else { return }
+        let stillUsed = SyncService.referencedMedia(library)
+        let orphans = candidates.subtracting(stillUsed)
+        guard !orphans.isEmpty else { return }
+        for name in orphans {
+            try? FileManager.default.removeItem(at: Store.mediaDir.appendingPathComponent(name))
+        }
+        // Borra en el servidor y, ya liberado el espacio, recalcula el uso y reintenta lo pausado.
+        Task {
+            for name in orphans { await sync.deleteMedia(name) }
+            await sync.refreshUsage()
+        }
+    }
+
     // MARK: - Importar imágenes
+
+    /// Suelta piezas arrastradas al lienzo (Finder, navegador u otras apps), en cascada.
+    func drop(_ providers: [NSItemProvider], at point: CGPoint) {
+        for (i, provider) in providers.enumerated() {
+            loadDropped(provider, at: point + CGPoint(x: Double(i) * 26, y: Double(i) * 26))
+        }
+    }
+
+    /// Resuelve un elemento arrastrado en orden de preferencia: archivo local, datos de imagen
+    /// o, por último, una URL remota que haya que descargar (como al arrastrar desde el navegador).
+    private func loadDropped(_ provider: NSItemProvider, at point: CGPoint) {
+        // 1) Archivo del Finder. La copia a disco se hace fuera del hilo principal para no congelar
+        // la app al soltar; sólo se vuelve a main para insertar la pieza ya lista.
+        if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                Task.detached(priority: .userInitiated) {
+                    guard let name = Store.storeMedia(copyingFrom: url) else { return }
+                    await self.placeImported(name, at: point, kind: .image)
+                }
+            }
+            return
+        }
+        // 2) Datos de imagen (navegador, apps): tiff, png, jpeg, heic… También fuera de main.
+        if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
+            provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+                guard let data else { return }
+                let ext = UTType(type)?.preferredFilenameExtension ?? "png"
+                Task.detached(priority: .userInitiated) {
+                    guard let name = Store.storeMedia(data: data, ext: ext) else { return }
+                    await self.placeImported(name, at: point, kind: .image)
+                }
+            }
+            return
+        }
+        // 3) URL remota: se baja la imagen (arrastre de una foto desde una página web).
+        if provider.hasItemConformingToTypeIdentifier(UTType.url.identifier) {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.scheme == "http" || url.scheme == "https" else { return }
+                Task { @MainActor in await self.addRemoteImage(from: url, at: point) }
+            }
+        }
+    }
+
+    /// Descarga una imagen de una URL http(s) y la coloca en el punto indicado.
+    private func addRemoteImage(from url: URL, at point: CGPoint) async {
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              NSImage(data: data) != nil else { return }
+        let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension.lowercased()
+        if let item = makeImageItem(from: data, ext: ext, at: point) { add(item) }
+    }
+
+    /// Inserta en el tablero una imagen ya guardada en el almacén (la copia a disco ya se hizo fuera
+    /// del hilo principal) y lanza su subida al servidor. El tamaño se lee de la cabecera, sin decodificar.
+    private func placeImported(_ fileName: String, at point: CGPoint, kind: ItemKind) {
+        add(imageItem(fileName: fileName, at: point, kind: kind))
+        Task { await sync.uploadMedia(fileName, tracked: true) }
+    }
 
     /// Copia una imagen al almacén y devuelve la pieza lista para colocar.
     func makeImageItem(from url: URL, at point: CGPoint, kind: ItemKind = .image) -> BoardItem? {
@@ -902,15 +1174,50 @@ final class Store: ObservableObject {
     }
 
     func makeImageItem(from data: Data, ext: String, at point: CGPoint, kind: ItemKind = .image) -> BoardItem? {
-        let name = UUID().uuidString + "." + ext
-        let dest = Store.mediaDir.appendingPathComponent(name)
-        guard (try? data.write(to: dest)) != nil else { return nil }
+        guard let name = Store.storeMedia(data: data, ext: ext) else { return nil }
+        Task { await sync.uploadMedia(name, tracked: true) }
         return imageItem(fileName: name, at: point, kind: kind)
+    }
+
+    /// Dimensiones en píxeles leyendo sólo la cabecera del archivo, sin decodificar el bitmap: medir
+    /// una foto con `NSImage(contentsOf:)` la descomprimía entera en RAM (cientos de MB en las grandes)
+    /// en el hilo principal, lo que congelaba la app al soltarla.
+    nonisolated static func pixelSize(of url: URL) -> CGSize? {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let w = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let h = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue else { return nil }
+        // Orientaciones EXIF 5–8 giran 90°/270°: el ancho y el alto quedan intercambiados.
+        if let o = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue, o >= 5 {
+            return CGSize(width: h, height: w)
+        }
+        return CGSize(width: w, height: h)
+    }
+
+    /// Copia un archivo al almacén de medios y devuelve su nombre. Sólo I/O: apto para ejecutarse fuera
+    /// del hilo principal. La subida al servidor la lanza quien inserte la pieza.
+    nonisolated static func storeMedia(copyingFrom url: URL) -> String? {
+        let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension.lowercased()
+        let name = UUID().uuidString + "." + ext
+        let dest = mediaDir.appendingPathComponent(name)
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        if (try? FileManager.default.copyItem(at: url, to: dest)) != nil { return name }
+        // Algunas fuentes (Fotos, navegadores) sólo dan datos, no un archivo copiable.
+        guard let data = try? Data(contentsOf: url), (try? data.write(to: dest)) != nil else { return nil }
+        return name
+    }
+
+    /// Escribe datos de imagen en el almacén y devuelve el nombre. Sólo I/O, apto para fondo.
+    nonisolated static func storeMedia(data: Data, ext: String) -> String? {
+        let name = UUID().uuidString + "." + ext
+        let dest = mediaDir.appendingPathComponent(name)
+        return (try? data.write(to: dest)) != nil ? name : nil
     }
 
     private func imageItem(fileName: String, at point: CGPoint, kind: ItemKind) -> BoardItem {
         let url = Store.mediaDir.appendingPathComponent(fileName)
-        let pixels = NSImage(contentsOf: url)?.size ?? CGSize(width: 320, height: 220)
+        let pixels = Store.pixelSize(of: url) ?? CGSize(width: 320, height: 220)
         // Las fotos entran con un ancho fijo; el alto sigue la proporción original.
         var w = Grid.imageWidth
         var h = Grid.snap(w * pixels.height / max(pixels.width, 1))
@@ -926,19 +1233,9 @@ final class Store: ObservableObject {
     }
 
     private func copyIntoMedia(_ url: URL) -> String? {
-        let ext = url.pathExtension.isEmpty ? "png" : url.pathExtension.lowercased()
-        let name = UUID().uuidString + "." + ext
-        let dest = Store.mediaDir.appendingPathComponent(name)
-        let scoped = url.startAccessingSecurityScopedResource()
-        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        do {
-            try FileManager.default.copyItem(at: url, to: dest)
-            return name
-        } catch {
-            // Algunas fuentes (Fotos, navegadores) sólo dan datos, no un archivo copiable.
-            guard let data = try? Data(contentsOf: url), (try? data.write(to: dest)) != nil else { return nil }
-            return name
-        }
+        guard let name = Store.storeMedia(copyingFrom: url) else { return nil }
+        Task { await sync.uploadMedia(name, tracked: true) }
+        return name
     }
 
     /// Pega imágenes o texto del portapapeles en el punto indicado.
@@ -962,13 +1259,13 @@ final class Store: ObservableObject {
             return
         }
         if let text = pb.string(forType: .string), !text.isEmpty {
-            add(noteItem(at: point, text: text))
+            add(textItem(at: point, text: text))
         }
     }
 
-    /// Bloque de texto sin fondo, listo para escribir desde el punto clicado.
-    func textItem(at point: CGPoint) -> BoardItem {
-        var item = BoardItem(kind: .text, x: Grid.snap(point.x), y: Grid.snap(point.y - 20), w: 320, h: 40)
+    /// Nota de texto sin fondo, lista para escribir desde el punto indicado.
+    func textItem(at point: CGPoint, text: String = "") -> BoardItem {
+        var item = BoardItem(kind: .text, x: Grid.snap(point.x), y: Grid.snap(point.y - 20), w: 320, h: 40, text: text)
         item.h = textHeight(for: item)
         return item
     }
@@ -1018,9 +1315,188 @@ final class Store: ObservableObject {
         }
     }
 
-    func noteItem(at point: CGPoint, text: String = "") -> BoardItem {
-        BoardItem(kind: .note, x: point.x - 110, y: point.y - 70, w: 220, h: 140,
-                  text: text, colorHex: Palette.colors[0])
+    // MARK: - Herramientas arrastrables
+
+    /// Crea la pieza de una herramienta soltada en el lienzo y la deja lista para usar.
+    /// Si se suelta sobre una columna, la pieza entra en ella.
+    func createTool(_ tool: ToolKind, at point: CGPoint) {
+        focusArea = .canvas
+        switch tool {
+        case .board:
+            addBoardFolder(at: point)
+        case .note:
+            let item = textItem(at: point)
+            add(item)
+            editingItem = item.id
+        case .column:
+            let item = columnItem(at: point)
+            add(item)
+            editingItem = item.id   // empieza nombrando la cabecera
+        }
+    }
+
+    /// Contenedor en columna vacío, centrado en el punto indicado.
+    func columnItem(at point: CGPoint) -> BoardItem {
+        var item = BoardItem(kind: .column,
+                             x: Grid.snap(point.x - 130), y: Grid.snap(point.y - 20),
+                             w: 260, h: 0)
+        item.children = []
+        item.h = columnHeight(for: item)
+        return item
+    }
+
+    // MARK: - Columnas
+
+    /// Métricas de la tarjeta de columna; las comparten la vista y el cálculo de alto.
+    enum ColumnMetrics {
+        static let header: Double = 52      // alto de la cabecera con el nombre (más aire arriba/abajo)
+        static let padding: Double = 10     // margen interior alrededor del contenido
+        static let spacing: Double = 8      // separación entre piezas apiladas
+        static let empty: Double = 70       // alto de la zona vacía «arrastra aquí»
+    }
+
+    /// Alto que necesita una columna para su cabecera y las piezas que contiene, a la retícula.
+    func columnHeight(for column: BoardItem) -> Double {
+        let inner = max(column.w - ColumnMetrics.padding * 2, 20)
+        let ids = column.children ?? []
+        let items = ids.compactMap { id in activeBoard?.items.first { $0.id == id } }
+        var body = 0.0
+        if items.isEmpty {
+            body = ColumnMetrics.empty
+        } else {
+            for (i, child) in items.enumerated() {
+                body += child.h * inner / max(child.w, 1)
+                if i > 0 { body += ColumnMetrics.spacing }
+            }
+        }
+        return Grid.snapUp(ColumnMetrics.header + ColumnMetrics.padding * 2 + body)
+    }
+
+    /// Ids de las piezas que ya pertenecen a alguna columna (no se dibujan sueltas en el lienzo).
+    var claimedItemIDs: Set<UUID> {
+        Set((activeBoard?.items ?? []).flatMap { $0.children ?? [] })
+    }
+
+    /// Columna cuyo marco contiene el punto dado (para soltar piezas dentro).
+    func columnID(at point: CGPoint) -> UUID? {
+        activeBoard?.items.first { $0.kind == .column && $0.frameRect.contains(point) }?.id
+    }
+
+    /// Columna cuyo marco **se solapa** con `rect` (la de mayor solape si hay varias). Así basta con
+    /// que una esquina de la pieza arrastrada toque la zona del contenedor: no hace falta centrarla.
+    func columnID(overlapping rect: CGRect, excluding: Set<UUID> = []) -> UUID? {
+        var best: (id: UUID, area: Double)?
+        for item in activeBoard?.items ?? [] where item.kind == .column && !excluding.contains(item.id) {
+            let inter = item.frameRect.intersection(rect)
+            guard !inter.isNull, !inter.isEmpty else { continue }
+            let area = Double(inter.width * inter.height)
+            if area > (best?.area ?? 0) { best = (id: item.id, area: area) }
+        }
+        return best?.id
+    }
+
+    /// Posición (0…nº de hijos) que ocuparía una pieza soltada en `point` dentro de la columna:
+    /// compara el punto con el centro de cada hijo ya apilado. La comparte el indicador de la vista.
+    func dropIndex(in columnID: UUID, at point: CGPoint) -> Int {
+        guard let column = activeBoard?.items.first(where: { $0.id == columnID }) else { return 0 }
+        let inner = max(column.w - ColumnMetrics.padding * 2, 20)
+        let items = (column.children ?? []).compactMap { id in activeBoard?.items.first { $0.id == id } }
+        var y = column.y + ColumnMetrics.header + ColumnMetrics.padding
+        for (i, child) in items.enumerated() {
+            let h = child.h * inner / max(child.w, 1)
+            if point.y < y + h / 2 { return i }
+            y += h + ColumnMetrics.spacing
+        }
+        return items.count
+    }
+
+    /// Pieza hija cuya fila (en la disposición apilada) contiene el punto del tablero, o nil si el
+    /// punto cae en la cabecera o fuera del cuerpo. Sirve para que el arrastre de la columna sepa si
+    /// el toque empezó sobre una pieza (y haya que sacarla) o en zona libre (mover la columna).
+    func childID(in columnID: UUID, at point: CGPoint) -> UUID? {
+        guard let column = activeBoard?.items.first(where: { $0.id == columnID }) else { return nil }
+        let inner = max(column.w - ColumnMetrics.padding * 2, 20)
+        let items = (column.children ?? []).compactMap { id in activeBoard?.items.first { $0.id == id } }
+        var y = column.y + ColumnMetrics.header + ColumnMetrics.padding
+        for child in items {
+            let h = child.h * inner / max(child.w, 1)
+            if point.y >= y && point.y < y + h { return child.id }
+            y += h + ColumnMetrics.spacing
+        }
+        return nil
+    }
+
+    /// Mete piezas en una columna (en `index`, o al final si es nil), quitándolas de cualquier otra.
+    /// Devuelve si cambió algo.
+    @discardableResult
+    func claim(_ ids: [UUID], into columnID: UUID, at index: Int? = nil) -> Bool {
+        let incoming = ids.filter { $0 != columnID && itemKind($0) != .column }
+        guard !incoming.isEmpty else { return false }
+        mutateBoard { board in
+            // Primero se desvinculan de su columna anterior.
+            for i in board.items.indices {
+                board.items[i].children?.removeAll { incoming.contains($0) }
+            }
+            guard let c = board.items.firstIndex(where: { $0.id == columnID }) else { return }
+            var list = board.items[c].children ?? []
+            let at = min(max(index ?? list.count, 0), list.count)
+            list.insert(contentsOf: incoming, at: at)
+            board.items[c].children = list
+        }
+        refitColumnHeight(columnID)
+        return true
+    }
+
+    /// Saca las piezas de una columna y las reparte sueltas bajo ella, en el lienzo.
+    /// El historial lo registra quien llama (el menú «Vaciar» o `deleteSelection`).
+    func releaseColumn(_ columnID: UUID) {
+        guard let column = activeBoard?.items.first(where: { $0.id == columnID }),
+              let ids = column.children, !ids.isEmpty else { return }
+        var y = column.frameRect.maxY + Grid.gutter
+        let x = Grid.snap(column.x)
+        mutateBoard { board in
+            for id in ids {
+                guard let i = board.items.firstIndex(where: { $0.id == id }) else { continue }
+                board.items[i].x = x
+                board.items[i].y = Grid.snap(y)
+                y += board.items[i].h + Grid.gutter
+            }
+            if let c = board.items.firstIndex(where: { $0.id == columnID }) {
+                board.items[c].children = []
+            }
+        }
+        refitColumnHeight(columnID)
+    }
+
+    func refitColumnHeight(_ id: UUID) {
+        mutateBoard { board in
+            guard let i = board.items.firstIndex(where: { $0.id == id }), board.items[i].kind == .column else { return }
+            board.items[i].h = columnHeight(for: board.items[i])
+        }
+    }
+
+    /// Saca una pieza de su columna y la deja suelta en el lienzo en `origin` (lo usa el arrastre
+    /// para sacarla siguiendo el cursor). No hace nada si la pieza no pertenece a ninguna columna.
+    func releaseItem(_ id: UUID, at origin: CGPoint) {
+        guard let board = activeBoard,
+              let column = board.items.first(where: { ($0.children ?? []).contains(id) }) else { return }
+        checkpoint()
+        let columnID = column.id
+        mutateBoard { board in
+            if let c = board.items.firstIndex(where: { $0.id == columnID }) {
+                board.items[c].children?.removeAll { $0 == id }
+            }
+            if let i = board.items.firstIndex(where: { $0.id == id }) {
+                board.items[i].origin = origin
+                board.items[i].z = board.topZ
+            }
+        }
+        refitColumnHeight(columnID)
+        selection = [id]
+    }
+
+    private func itemKind(_ id: UUID) -> ItemKind? {
+        activeBoard?.items.first { $0.id == id }?.kind
     }
 
     private func isImage(_ url: URL) -> Bool {

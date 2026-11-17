@@ -33,23 +33,6 @@ extension ItemKind {
     var keepsRatio: Bool { self == .image || self == .frame }
 }
 
-/// Cursor según la herramienta activa (macOS 15+).
-struct ToolCursor: ViewModifier {
-    let tool: Store.Tool
-
-    func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            switch tool {
-            case .select: content
-            case .text: content.pointerStyle(.horizontalText)
-            case .note, .board: content.pointerStyle(.rectSelection)
-            }
-        } else {
-            content
-        }
-    }
-}
-
 extension BoardItem {
     var resolvedFontSize: Double { fontSize ?? (kind == .note ? 14 : TextStyle.body.size) }
 
@@ -68,6 +51,23 @@ extension BoardItem {
     }
 
     var swiftUIFont: Font { Font(nsFont as CTFont) }
+}
+
+/// Fuentes que también se ven en la versión web del tablero (deben coincidir con la lista
+/// `WEB_FONTS` del Worker). Para usarlas hay que tenerlas instaladas en el Mac; se consiguen
+/// gratis en Google Fonts con el mismo nombre.
+enum WebFonts {
+    /// Disponibles como webfont de Google (deben coincidir con `WEB_FONTS` del Worker).
+    static let googleFamilies: Set<String> = [
+        "Inter", "Poppins", "Montserrat", "Playfair Display",
+        "Lora", "Roboto Mono", "Caveat", "Bebas Neue",
+    ]
+    /// Fuentes de autor autoservidas desde el servidor (deben coincidir con `CUSTOM_FONTS` del Worker).
+    static let customFamilies: Set<String> = [
+        "Anaktoria", "ASTREVA",
+    ]
+    /// Todas las que se ven en la versión web.
+    static let families: Set<String> = googleFamilies.union(customFamilies)
 }
 
 /// Fuentes favoritas, guardadas en las preferencias del usuario.
@@ -135,10 +135,13 @@ struct FontPicker: View {
                 .padding(.vertical, 4)
             }
             Divider()
-            Text("Clic derecho sobre una fuente: Título, Subtítulo o Texto")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(8)
+            VStack(spacing: 3) {
+                Text("Clic derecho sobre una fuente: Título, Subtítulo o Texto")
+                Label("se ve igual en la versión web", systemImage: "globe")
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .padding(8)
         }
         .frame(width: 280, height: 380)
     }
@@ -161,6 +164,12 @@ struct FontPicker: View {
             Text(name)
                 .font(Font(preview as CTFont))
                 .lineLimit(1)
+            if let family, WebFonts.families.contains(family) {
+                Image(systemName: "globe")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .help("Se ve igual en la versión web")
+            }
             Spacer()
             if current == family {
                 Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
@@ -188,33 +197,33 @@ struct FontPicker: View {
     }
 }
 
-/// Paleta de herramientas flotante a la derecha.
+/// Paleta de herramientas flotante a la derecha. Cada herramienta se arrastra al lienzo para usarla.
 struct ToolPalette: View {
-    @EnvironmentObject var store: Store
-
     var body: some View {
-        VStack(spacing: 4) {
-            button(.text, icon: "textformat", help: "Texto (T)")
-            button(.note, icon: "note.text", help: "Nota (N)")
-            button(.board, icon: "folder", help: "Tablero dentro (B)")
+        VStack(spacing: 6) {
+            ForEach(ToolKind.allCases) { chip($0) }
         }
-        .padding(5)
+        .padding(6)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(.primary.opacity(0.1)))
         .shadow(color: .black.opacity(0.15), radius: 8, y: 3)
     }
 
-    private func button(_ tool: Store.Tool, icon: String, help: String) -> some View {
-        let active = store.tool == tool
-        return Button { store.tool = active ? .select : tool } label: {
-            Image(systemName: icon)
-                .font(.system(size: 14, weight: .medium))
-                .frame(width: 32, height: 32)
-                .foregroundStyle(active ? Color.white : Color.primary)
-                .background(RoundedRectangle(cornerRadius: 8).fill(active ? Color.accentColor : .clear))
-                .contentShape(Rectangle())
+    /// Ficha arrastrable: icono con el nombre de la herramienta a sus pies.
+    private func chip(_ tool: ToolKind) -> some View {
+        VStack(spacing: 2) {
+            Image(systemName: tool.icon)
+                .font(.system(size: 15, weight: .medium))
+                .frame(width: 34, height: 28)
+            Text(tool.title)
+                .font(.system(size: 9, weight: .medium))
+                .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .help(help)
+        .frame(width: 48)
+        .padding(.vertical, 4)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.primary.opacity(0.04)))
+        .contentShape(Rectangle())
+        .help("Arrastra «\(tool.title)» al tablero")
+        .onDrag { NSItemProvider(object: tool.dragPayload as NSString) }
     }
 }

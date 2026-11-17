@@ -4,13 +4,61 @@ import CoreGraphics
 /// Tipo de pieza que vive en un tablero.
 enum ItemKind: String, Codable {
     case image      // foto suelta
-    case note       // nota de texto de color
+    case note       // nota de papel de color (en desuso: sólo para tableros antiguos)
     case frame      // viñeta de storyboard: imagen + pie de texto
-    case text       // bloque de texto sin fondo
+    case text       // nota de texto sin fondo
     case board      // pseudo carpeta: abre un sub-tablero propio
+    case column     // contenedor en columna: organiza otras piezas apiladas
 
     /// Piezas cuyo texto se puede tipografiar.
     var hasTypography: Bool { self == .text || self == .note }
+}
+
+/// Herramientas que se arrastran desde la paleta de la derecha hasta el lienzo.
+enum ToolKind: String, CaseIterable, Identifiable {
+    case note       // nota de texto sin fondo
+    case column     // contenedor en columna
+    case board      // carpeta: sub-tablero
+
+    var id: String { rawValue }
+
+    /// Nombre al pie de la herramienta en la paleta.
+    var title: String {
+        switch self {
+        case .note: "Nota"
+        case .column: "Columna"
+        case .board: "Tablero"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .note: "textformat"
+        case .column: "rectangle.split.1x2"
+        case .board: "folder"
+        }
+    }
+
+    /// Tipo de pieza que crea al soltarse.
+    var itemKind: ItemKind {
+        switch self {
+        case .note: .text
+        case .column: .column
+        case .board: .board
+        }
+    }
+
+    // MARK: - Carga útil de arrastre (texto plano con un prefijo propio)
+
+    // Sin dos puntos a propósito: un «:» haría que NSItemProvider lo registrara además como
+    // `public.url` y el arrastre se confundiría con el de imágenes.
+    static let dragPrefix = "moodboard-tool/"
+    var dragPayload: String { Self.dragPrefix + rawValue }
+
+    init?(payload: String) {
+        guard payload.hasPrefix(Self.dragPrefix) else { return nil }
+        self.init(rawValue: String(payload.dropFirst(Self.dragPrefix.count)))
+    }
 }
 
 struct BoardItem: Identifiable, Codable, Hashable {
@@ -34,6 +82,8 @@ struct BoardItem: Identifiable, Codable, Hashable {
     var crop: CGRect?
     /// Sub-tablero que abre esta carpeta (sólo en piezas `.board`).
     var childBoardID: UUID?
+    /// Piezas contenidas, en orden de arriba a abajo (sólo en contenedores `.column`).
+    var children: [UUID]?
 
     var origin: CGPoint {
         get { CGPoint(x: x, y: y) }
@@ -75,6 +125,8 @@ struct Board: Identifiable, Codable, Hashable {
     var activeNoteID: UUID?
     /// Tablero padre si éste es un sub-tablero de una carpeta; nil = tablero de primer nivel.
     var parentID: UUID?
+    /// Nombre de archivo de la imagen usada como portada del enlace compartido (nil = la primera foto).
+    var cover: String?
 
     var isScript: Bool { kind == .script }
     var isNotes: Bool { kind == .notes }
@@ -270,6 +322,37 @@ extension Library {
         activeBoardID = try c.decodeIfPresent(UUID.self, forKey: .activeBoardID)
         trash = try c.decodeIfPresent([TrashEntry].self, forKey: .trash) ?? []
         openBoardIDs = try c.decodeIfPresent([UUID].self, forKey: .openBoardIDs) ?? []
+    }
+
+    /// Une esta biblioteca con otra **sin perder tableros**: los que existen en ambas se quedan con
+    /// la versión modificada más recientemente; los que sólo están en una se conservan. La papelera
+    /// se une por id. Es la pieza que hace la sincronización no-destructiva: ni un servidor vacío
+    /// puede vaciar el disco, ni el disco puede vaciar el servidor al adoptar su versión.
+    /// Mantiene el estado de interfaz local (pestañas y tablero activo).
+    func merged(with other: Library) -> Library {
+        var winner: [UUID: Board] = [:]
+        for board in boards { winner[board.id] = board }
+        for board in other.boards {
+            if let mine = winner[board.id] {
+                if board.lastModified > mine.lastModified { winner[board.id] = board }
+            } else {
+                winner[board.id] = board
+            }
+        }
+        // Orden estable: primero los tableros locales en su orden; luego los que sólo trae el otro.
+        var order: [UUID] = []
+        var seen: Set<UUID> = []
+        for board in boards + other.boards where seen.insert(board.id).inserted {
+            order.append(board.id)
+        }
+        var result = self
+        result.boards = order.compactMap { winner[$0] }
+        // Papelera: unión por id, conservando primero la local.
+        var trashSeen = Set(trash.map(\.id))
+        for entry in other.trash where trashSeen.insert(entry.id).inserted {
+            result.trash.append(entry)
+        }
+        return result
     }
 }
 

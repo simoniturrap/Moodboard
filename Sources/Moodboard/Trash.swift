@@ -74,7 +74,7 @@ struct TrashSheet: View {
     private func thumbnail(_ entry: TrashEntry) -> some View {
         switch entry.content {
         case .item(let item, _, _):
-            if let file = item.media, let img = ImageCache.shared.image(named: file) {
+            if let file = item.media, let img = ImageCache.shared.thumbnail(named: file, maxPixel: 128) {
                 Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
             } else {
                 RoundedRectangle(cornerRadius: 6)
@@ -98,8 +98,9 @@ struct TrashSheet: View {
             case .image: return "Imagen"
             case .note:  return firstLine.isEmpty ? "Nota" : firstLine
             case .frame: return firstLine.isEmpty ? "Viñeta" : "Viñeta: " + firstLine
-            case .text:  return firstLine.isEmpty ? "Texto" : firstLine
+            case .text:  return firstLine.isEmpty ? "Nota" : firstLine
             case .board: return firstLine.isEmpty ? "Carpeta de tableros" : "Carpeta: " + firstLine
+            case .column: return firstLine.isEmpty ? "Columna" : "Columna: " + firstLine
             }
         }
     }

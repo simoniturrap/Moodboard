@@ -15,7 +15,14 @@ struct BoardCanvas: View {
     @State private var dragPrimary: UUID?
     /// Eje bloqueado con ⇧ durante el arrastre.
     @State private var dragAxis: Axis?
+    /// Columna bajo lo que se arrastra y posición de inserción: resalta la zona y dibuja el indicador.
+    @State private var dropTarget: (column: UUID, index: Int)?
     @State private var marquee: CGRect?
+    /// Origen (en el tablero) de una pieza que se está sacando de una columna por arrastre.
+    @State private var childDragBase: CGPoint?
+    /// Pieza que se está sacando de una columna en el arrastre actual (lo conduce el gesto de la
+    /// columna, no el de la pieza: así no se interrumpe cuando la pieza abandona el contenedor).
+    @State private var childDragID: UUID?
     @State private var viewportSize: CGSize = .zero
     @State private var isTargeted = false
     /// Último zoom distinto de 100 %, para alternar con Z.
@@ -59,16 +66,14 @@ struct BoardCanvas: View {
                 DotGrid(camera: camera)
                     .contentShape(Rectangle())
                     .gesture(backgroundDrag)
-                    .modifier(ToolCursor(tool: store.tool))
                     .onTapGesture { location in
-                        if placeWithTool(at: location) { return }
                         store.selection = []
                         store.editingItem = nil
                         store.focusArea = .canvas
                         withAnimation(.spring(duration: 0.3, bounce: 0.18)) { store.isBoardMenuOpen = false }
                     }
                     .onTapGesture(count: 2) { location in
-                        let item = store.noteItem(at: toWorld(location))
+                        let item = store.textItem(at: toWorld(location))
                         store.add(item)
                         store.editingItem = item.id
                     }
@@ -142,18 +147,10 @@ struct BoardCanvas: View {
                         .allowsHitTesting(false)
                 }
             }
-            .dropDestination(for: URL.self) { urls, location in
-                var offset = CGPoint.zero
-                var added = false
-                for url in urls {
-                    if let item = store.makeImageItem(from: url, at: toWorld(location) + offset) {
-                        store.add(item)
-                        offset.x += 26; offset.y += 26
-                        added = true
-                    }
-                }
-                return added
-            } isTargeted: { isTargeted = $0 }
+            .onDrop(of: [UTType.image, UTType.fileURL, UTType.url, UTType.utf8PlainText], isTargeted: $isTargeted) { providers, location in
+                handleDrop(providers, at: toWorld(location))
+                return true
+            }
         }
         .focusable()
         .focusEffectDisabled()
@@ -167,7 +164,9 @@ struct BoardCanvas: View {
     /// de pantalla hacía el desplazamiento y el zoom más pesados. El margen (medio viewport)
     /// las deja listas antes de entrar, para que no aparezcan de golpe al desplazarse.
     private var visibleItems: [BoardItem] {
-        let all = (board?.items ?? []).sorted { $0.z < $1.z }
+        // Las piezas que viven dentro de una columna las dibuja la columna, no el lienzo.
+        let claimed = store.claimedItemIDs
+        let all = (board?.items ?? []).filter { !claimed.contains($0.id) }.sorted { $0.z < $1.z }
         guard viewportSize.width > 0, viewportSize.height > 0 else { return all }
         let origin = toWorld(.zero)
         let visible = CGRect(x: origin.x, y: origin.y,
@@ -186,8 +185,20 @@ struct BoardCanvas: View {
                          isSelected: isSelected,
                          isEditing: store.editingItem == item.id,
                          onTextChange: { store.updateText(item.id, $0) },
-                         onEndEditing: { store.editingItem = nil })
+                         onEndEditing: { store.editingItem = nil },
+                         siblings: board?.items ?? [],
+                         dropIndex: dropTarget?.column == item.id ? dropTarget?.index : nil,
+                         selectedChildren: store.selection,
+                         onChildTap: { id in
+                             store.focusArea = .canvas
+                             store.editingItem = nil
+                             store.selection = [id]
+                         })
                     .frame(width: item.w, height: item.h)
+                    // Una columna que recalcula su alto al ganar o perder contenido crece/encoge
+                    // animada; el resto de piezas conserva el redimensionado manual sin rebote.
+                    .animation(item.kind == .column ? .spring(duration: 0.4, bounce: 0.18) : nil,
+                               value: item.h)
                     .gesture(itemDrag(item))
                     .simultaneousGesture(TapGesture().onEnded { select(item) })
                     .simultaneousGesture(TapGesture(count: 2).onEnded {
@@ -203,6 +214,7 @@ struct BoardCanvas: View {
                     .contextMenu {
                         if item.kind == .image { imageMenu(item) }
                         if item.kind == .board { boardMenu(item) }
+                        if item.kind == .column { columnMenu(item) }
                     }
                     .overlay {
                         // Las asas de redimensionar sólo en lo seleccionado: antes había 4 por pieza
@@ -272,8 +284,9 @@ struct BoardCanvas: View {
                 if let m = marquee {
                     let world = CGRect(origin: toWorld(m.origin),
                                        size: CGSize(width: m.width / scale, height: m.height / scale))
+                    let claimed = store.claimedItemIDs
                     let hit = Set((board?.items ?? [])
-                        .filter { world.intersects($0.frameRect) }
+                        .filter { !claimed.contains($0.id) && world.intersects($0.frameRect) }
                         .map(\.id))
                     store.focusArea = .canvas
                     store.editingItem = nil
@@ -290,8 +303,9 @@ struct BoardCanvas: View {
                 let base = panOrigin ?? camera
                 if panOrigin == nil { panOrigin = camera }
                 store.mutateBoard {
-                    $0.camera.x = base.x + value.translation.width
-                    $0.camera.y = base.y + value.translation.height
+                    $0.camera = draggedCamera(Camera(x: base.x + value.translation.width,
+                                                     y: base.y + value.translation.height,
+                                                     scale: base.scale))
                 }
             }
             .onEnded { _ in panOrigin = nil }
@@ -300,6 +314,17 @@ struct BoardCanvas: View {
     private func itemDrag(_ item: BoardItem) -> some Gesture {
         DragGesture(minimumDistance: 1, coordinateSpace: .named("viewport"))
             .onChanged { value in
+                // Si el arrastre empieza sobre una pieza contenida en una columna, se saca esa pieza
+                // en vez de mover la columna. Lo lleva este gesto (el de la columna), que sobrevive a
+                // que la pieza abandone el contenedor; el de la pieza desaparecía con ella.
+                if dragOrigins.isEmpty && childDragID == nil && item.kind == .column {
+                    childDragID = store.childID(in: item.id, at: toWorld(value.startLocation))
+                }
+                if let child = childDragID {
+                    childDragChanged(child, start: value.startLocation,
+                                     translation: value.translation, first: childDragBase == nil)
+                    return
+                }
                 if dragOrigins.isEmpty {
                     // Mover no selecciona: si la pieza ya estaba seleccionada se mueve el grupo,
                     // si no, se mueve sola y se limpia la selección anterior.
@@ -333,8 +358,25 @@ struct BoardCanvas: View {
                 for (id, origin) in dragOrigins {
                     store.update(id) { $0.origin = CGPoint(x: origin.x + dx, y: origin.y + dy) }
                 }
+                // Resalta la columna que se solapa con lo arrastrado (basta tocar una esquina) y
+                // calcula dónde entraría según la altura del cursor/centro.
+                let draggedIDs = Set(dragOrigins.keys)
+                if let primary = board?.items.first(where: { $0.id == (dragPrimary ?? item.id) }),
+                   let target = store.columnID(overlapping: primary.frameRect, excluding: draggedIDs) {
+                    let center = CGPoint(x: primary.frameRect.midX, y: primary.frameRect.midY)
+                    dropTarget = (target, store.dropIndex(in: target, at: center))
+                } else {
+                    dropTarget = nil
+                }
             }
             .onEnded { _ in
+                // Si se estaba sacando una pieza de una columna, se cierra ese arrastre (entra en otra
+                // columna o se imanta a la retícula) y no se aplica la lógica de movimiento normal.
+                if let child = childDragID {
+                    childDragEnded(child)
+                    childDragID = nil
+                    return
+                }
                 // Imán al soltar: la pieza agarrada cae en la retícula y el resto la acompaña. ⌘ lo desactiva.
                 if !NSEvent.modifierFlags.contains(.command),
                    let current = board?.items.first(where: { $0.id == (dragPrimary ?? item.id) }) {
@@ -353,10 +395,54 @@ struct BoardCanvas: View {
                         }
                     }
                 }
+                // Soltar sobre una columna mete ahí lo arrastrado (organizador), en la posición marcada.
+                let draggedIDs = Array(dragOrigins.keys)
+                if let target = dropTarget, !draggedIDs.contains(target.column) {
+                    store.claim(draggedIDs, into: target.column, at: target.index)
+                }
+                dropTarget = nil
                 dragOrigins = [:]
                 dragPrimary = nil
                 dragAxis = nil
             }
+    }
+
+    /// Arrastre de una pieza desde dentro de una columna: al empezar la saca del contenedor y la
+    /// coloca bajo el cursor; luego la mueve con el dedo y resalta la columna sobre la que caería.
+    private func childDragChanged(_ id: UUID, start: CGPoint, translation: CGSize, first: Bool) {
+        if first {
+            guard let item = board?.items.first(where: { $0.id == id }) else { return }
+            let world = toWorld(start)
+            let origin = CGPoint(x: Grid.snap(world.x - item.w / 2), y: Grid.snap(world.y - item.h / 2))
+            childDragBase = origin
+            store.focusArea = .canvas
+            store.releaseItem(id, at: origin)   // registra el deshacer y la saca de la columna
+        }
+        guard let base = childDragBase else { return }
+        store.update(id) { $0.origin = CGPoint(x: base.x + translation.width / scale,
+                                               y: base.y + translation.height / scale) }
+        // Resalta la columna que se solapa con la pieza y dónde entraría (reutiliza el indicador normal).
+        if let moved = board?.items.first(where: { $0.id == id }) {
+            if let target = store.columnID(overlapping: moved.frameRect, excluding: [id]) {
+                let center = CGPoint(x: moved.frameRect.midX, y: moved.frameRect.midY)
+                dropTarget = (target, store.dropIndex(in: target, at: center))
+            } else {
+                dropTarget = nil
+            }
+        }
+    }
+
+    /// Soltó la pieza sacada: si cae sobre una columna entra ahí; si no, se imanta a la retícula.
+    private func childDragEnded(_ id: UUID) {
+        defer { childDragBase = nil; dropTarget = nil }
+        guard board?.items.contains(where: { $0.id == id }) == true else { return }
+        if let target = dropTarget {
+            store.claim([id], into: target.column, at: target.index)
+        } else {
+            withAnimation(.easeOut(duration: 0.12)) {
+                store.update(id) { $0.x = Grid.snap($0.x); $0.y = Grid.snap($0.y) }
+            }
+        }
     }
 
     /// Redimensiona desde cualquier esquina dejando fija la opuesta.
@@ -391,6 +477,11 @@ struct BoardCanvas: View {
                     probe.w = w
                     h = store.textHeight(for: probe)
                 }
+                if item.kind == .column {
+                    var probe = current
+                    probe.w = w
+                    h = store.columnHeight(for: probe)
+                }
                 withAnimation(.easeOut(duration: 0.12)) {
                     store.update(item.id) { $0.frameRect = corner.rect(from: base.frameRect, size: CGSize(width: w, height: h)) }
                 }
@@ -405,6 +496,7 @@ struct BoardCanvas: View {
         Button("Cortar") { target(item); store.cutSelection() }
         Button("Duplicar") { target(item); store.duplicateSelection() }
         Divider()
+        Button(store.isCover(item.id) ? "Quitar de portada" : "Usar como portada") { store.setCover(item.id) }
         Button("Descargar…") { store.downloadImage(item.id) }
     }
 
@@ -413,6 +505,17 @@ struct BoardCanvas: View {
     private func boardMenu(_ item: BoardItem) -> some View {
         Button("Abrir") { store.openBoardFolder(item) }
         Button("Renombrar") { store.selection = [item.id]; store.editingItem = item.id }
+        Divider()
+        Button("Duplicar") { target(item); store.duplicateSelection() }
+        Button("Eliminar", role: .destructive) { target(item); store.deleteSelection() }
+    }
+
+    /// Clic derecho sobre una columna: renombrar, vaciar o eliminar.
+    @ViewBuilder
+    private func columnMenu(_ item: BoardItem) -> some View {
+        Button("Renombrar") { store.selection = [item.id]; store.editingItem = item.id }
+        Button("Vaciar") { store.checkpoint(); store.releaseColumn(item.id) }
+            .disabled((item.children ?? []).isEmpty)
         Divider()
         Button("Duplicar") { target(item); store.duplicateSelection() }
         Button("Eliminar", role: .destructive) { target(item); store.deleteSelection() }
@@ -462,9 +565,6 @@ struct BoardCanvas: View {
                 store.deleteBoard(id)
             }
             return true
-        case 53 where store.tool != .select: // Esc suelta la herramienta
-            store.tool = .select
-            return true
         default:
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "z":
@@ -474,12 +574,10 @@ struct BoardCanvas: View {
                 } else {
                     setZoom(lastZoom)
                 }
-            case "t":
-                store.tool = store.tool == .text ? .select : .text
-            case "n":
-                store.tool = store.tool == .note ? .select : .note
-            case "b":
-                store.tool = store.tool == .board ? .select : .board
+            // Los atajos crean la pieza en el centro de lo que se ve (la paleta se usa arrastrando).
+            case "n": store.createTool(.note, at: viewportCenterInWorld)
+            case "c": store.createTool(.column, at: viewportCenterInWorld)
+            case "b": store.createTool(.board, at: viewportCenterInWorld)
             default:
                 return false
             }
@@ -489,25 +587,36 @@ struct BoardCanvas: View {
 
     // MARK: - Herramientas
 
-    /// Con Texto o Nota activas, el clic en el fondo crea la pieza y empieza a escribir.
-    private func placeWithTool(at location: CGPoint) -> Bool {
-        let point = toWorld(location)
-        store.focusArea = .canvas
-        let item: BoardItem
-        switch store.tool {
-        case .select: return false
-        case .board:
-            // La carpeta crea además su sub-tablero; addBoardFolder deja la pieza en edición.
-            store.addBoardFolder(at: point)
-            store.tool = .select
-            return true
-        case .text: item = store.textItem(at: point)
-        case .note: item = store.noteItem(at: point)
+    /// Reparte lo que se suelta en el lienzo: herramientas de la paleta, texto de otras apps, o imágenes.
+    private func handleDrop(_ providers: [NSItemProvider], at point: CGPoint) {
+        var media: [NSItemProvider] = []
+        for provider in providers {
+            // Texto plano puro (sin imagen, archivo ni URL): herramienta de la paleta o texto suelto.
+            // El texto de arrastre de las herramientas no lleva «:», así que no se registra como URL;
+            // una imagen arrastrada del navegador sí trae `url`/`image` y va por el flujo de medios.
+            let isTextual = provider.hasItemConformingToTypeIdentifier(UTType.utf8PlainText.identifier)
+                && !provider.hasItemConformingToTypeIdentifier(UTType.image.identifier)
+                && !provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+                && !provider.hasItemConformingToTypeIdentifier(UTType.url.identifier)
+            if isTextual {
+                _ = provider.loadObject(ofClass: NSString.self) { reading, _ in
+                    guard let string = reading as? String else { return }
+                    Task { @MainActor in
+                        if let tool = ToolKind(payload: string) {
+                            store.createTool(tool, at: point)
+                            // Al soltar la herramienta de texto, el lienzo salta al 100 % (manteniendo
+                            // fijo el punto soltado) para escribir a tamaño real.
+                            if tool == .note { zoomToActualSize(around: point) }
+                        } else if !string.isEmpty {
+                            store.add(store.textItem(at: point, text: string))
+                        }
+                    }
+                }
+            } else {
+                media.append(provider)
+            }
         }
-        store.add(item)
-        store.editingItem = item.id
-        store.tool = .select
-        return true
+        if !media.isEmpty { store.drop(media, at: point) }
     }
 
     /// Desplazamiento para dejar exactamente `Grid.gutter` de separación con la pieza vecina más cercana,
@@ -534,18 +643,92 @@ struct BoardCanvas: View {
 
     // MARK: - Zoom y desplazamiento
 
-    private func handleScroll(_ delta: CGVector, zooming: Bool) {
+    /// Cuánto se puede alejar la vista más allá del contenido, en px del tablero. Mantiene el
+    /// desplazamiento pegado al trabajo (nada de perderse en el vacío infinito).
+    private let panMargin: Double = 500
+    /// Anchura (en px de cámara) de la franja junto a cada borde donde el movimiento se va frenando
+    /// hasta detenerse. Sin rebotes ni muelles: sólo una reducción progresiva del movimiento.
+    private let brakeZone: Double = 320
+
+    /// Rectángulo que abarca todas las piezas del tablero (nil si no hay o aún no se midió la vista).
+    private var contentBounds: CGRect? {
+        guard viewportSize.width > 0, viewportSize.height > 0,
+              let items = board?.items, !items.isEmpty else { return nil }
+        return items.dropFirst().reduce(items[0].frameRect) { $0.union($1.frameRect) }
+    }
+
+    /// Rango permitido de la cámara en un eje, ya ordenado [lo, hi] (ver toScreen: screen =
+    /// world·escala + cámara). Cuando el contenido cabe entero, el rango se estrecha de forma
+    /// continua, sin saltos bruscos al centro.
+    private func axisRange(viewport: Double, scale: Double, contentLo: Double, contentHi: Double)
+        -> (lo: Double, hi: Double) {
+        let a = scale * (panMargin - contentLo)             // tope al desplazar hacia +
+        let b = viewport - scale * (contentHi + panMargin)  // tope al desplazar hacia −
+        return (min(a, b), max(a, b))
+    }
+
+    /// Frenado absoluto (arrastre con mano): en los últimos `soft` px junto a cada borde el avance
+    /// se reduce exponencialmente, acercándose al límite sin alcanzarlo ni pasarse (sin rebote).
+    private func damped(_ v: Double, lo: Double, hi: Double, soft: Double) -> Double {
+        guard hi > lo else { return lo }
+        let s = min(soft, (hi - lo) / 2)
+        if s <= 0 { return min(max(v, lo), hi) }
+        if v < lo + s { return lo + s * exp(-((lo + s) - v) / s) }   // asíntota a lo
+        if v > hi - s { return hi - s * exp(-(v - (hi - s)) / s) }   // asíntota a hi
+        return v
+    }
+
+    /// Frenado incremental (rueda/trackpad): cada delta se reduce según lo cerca que esté del borde
+    /// en esa dirección, de modo que el desplazamiento se detiene suave justo en el límite.
+    private func braked(_ cam: Double, delta: Double, lo: Double, hi: Double, soft: Double) -> Double {
+        guard hi > lo else { return lo }
+        let s = max(1, min(soft, (hi - lo) / 2))
+        let distance = delta >= 0 ? hi - cam : cam - lo
+        let factor = max(0, min(1, distance / s))
+        return min(max(cam + delta * factor, lo), hi)
+    }
+
+    /// Cámara recortada en firme al rango (para el zoom y los saltos de botón): nunca sale de él.
+    /// Como el rango es continuo, no hay salto al centro al pasar el contenido a caber entero.
+    private func clampedCamera(_ cam: Camera) -> Camera {
+        guard let b = contentBounds else { return cam }
+        let rx = axisRange(viewport: viewportSize.width, scale: cam.scale, contentLo: b.minX, contentHi: b.maxX)
+        let ry = axisRange(viewport: viewportSize.height, scale: cam.scale, contentLo: b.minY, contentHi: b.maxY)
+        var c = cam
+        c.x = min(max(cam.x, rx.lo), rx.hi)
+        c.y = min(max(cam.y, ry.lo), ry.hi)
+        return c
+    }
+
+    /// Cámara del arrastre con mano: posición absoluta con frenado suave junto a los bordes.
+    private func draggedCamera(_ cam: Camera) -> Camera {
+        guard let b = contentBounds else { return cam }
+        let rx = axisRange(viewport: viewportSize.width, scale: cam.scale, contentLo: b.minX, contentHi: b.maxX)
+        let ry = axisRange(viewport: viewportSize.height, scale: cam.scale, contentLo: b.minY, contentHi: b.maxY)
+        var c = cam
+        c.x = damped(cam.x, lo: rx.lo, hi: rx.hi, soft: brakeZone)
+        c.y = damped(cam.y, lo: ry.lo, hi: ry.hi, soft: brakeZone)
+        return c
+    }
+
+    private func handleScroll(_ delta: CGVector, zooming: Bool, phase: ScrollMomentum) {
         if zooming {
             zoom(by: 1 + delta.dy * 0.01, around: mouseInViewport())
-        } else {
-            store.mutateBoard {
-                $0.camera.x += delta.dx
-                $0.camera.y += delta.dy
-            }
+            return
+        }
+        guard let b = contentBounds else {
+            store.mutateBoard { $0.camera.x += delta.dx; $0.camera.y += delta.dy }
+            return
+        }
+        store.mutateBoard {
+            let rx = axisRange(viewport: viewportSize.width, scale: $0.camera.scale, contentLo: b.minX, contentHi: b.maxX)
+            let ry = axisRange(viewport: viewportSize.height, scale: $0.camera.scale, contentLo: b.minY, contentHi: b.maxY)
+            $0.camera.x = braked($0.camera.x, delta: delta.dx, lo: rx.lo, hi: rx.hi, soft: brakeZone)
+            $0.camera.y = braked($0.camera.y, delta: delta.dy, lo: ry.lo, hi: ry.hi, soft: brakeZone)
         }
     }
 
-    private func handleMagnify(_ magnification: CGFloat, at point: CGPoint) {
+    private func handleMagnify(_ magnification: CGFloat, at point: CGPoint, phase: ScrollMomentum) {
         zoom(by: 1 + magnification, around: point)
     }
 
@@ -556,14 +739,12 @@ struct BoardCanvas: View {
         let old = camera.scale
         let new = min(4, max(0.15, old * factor))
         guard new != old else { return }
-        // Mantiene fijo el punto bajo el cursor.
+        // Mantiene fijo el punto bajo el cursor. El rango es continuo, así que recortar en firme no
+        // produce saltos al cruzar el umbral de "cabe entero".
         let world = CGPoint(x: (pivot.x - camera.x) / old, y: (pivot.y - camera.y) / old)
+        let raw = Camera(x: pivot.x - world.x * new, y: pivot.y - world.y * new, scale: new)
         withAnimation(animated ? zoomSpring : nil) {
-            store.mutateBoard {
-                $0.camera.scale = new
-                $0.camera.x = pivot.x - world.x * new
-                $0.camera.y = pivot.y - world.y * new
-            }
+            store.mutateBoard { $0.camera = clampedCamera(raw) }
         }
     }
 
@@ -573,6 +754,12 @@ struct BoardCanvas: View {
 
     private func setZoom(_ value: Double) {
         zoom(by: value / camera.scale, around: mouseInViewport(), animated: true)
+    }
+
+    /// Lleva el lienzo al 100 % manteniendo fijo el punto del tablero indicado (el lugar soltado).
+    private func zoomToActualSize(around worldPoint: CGPoint) {
+        guard abs(camera.scale - 1) > 0.001 else { return }
+        zoom(by: 1 / camera.scale, around: toScreen(worldPoint), animated: true)
     }
 
     /// Encuadre al abrir un tablero: la esquina superior izquierda del contenido queda a
@@ -642,6 +829,11 @@ struct BoardCanvas: View {
             }
             .help("Exportar el tablero a PDF")
             .disabled(board?.items.isEmpty ?? true)
+            Button { store.shareActiveBoard() } label: {
+                Label("Compartir", systemImage: "square.and.arrow.up")
+            }
+            .help("Compartir un enlace público al tablero")
+            .disabled(!store.canShareActiveBoard)
         }
     }
 }

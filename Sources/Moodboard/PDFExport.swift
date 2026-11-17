@@ -46,12 +46,15 @@ enum PDFExporter {
 
     /// El tablero dibujado sin cámara ni selección, con fondo claro.
     private static func page(for board: Board) -> some View {
-        let items = board.items.sorted { $0.z < $1.z }.map(printable)
+        // Las piezas dentro de una columna las dibuja la columna, no el lienzo.
+        let claimed = Set(board.items.flatMap { $0.children ?? [] })
+        let items = board.items.filter { !claimed.contains($0.id) }.sorted { $0.z < $1.z }.map(printable)
         let bounds = items.dropFirst().reduce(items[0].frameRect) { $0.union($1.frameRect) }
         return ZStack(alignment: .topLeading) {
             ForEach(items) { item in
                 ItemView(item: item, scale: 1, isSelected: false, isEditing: false,
-                         onTextChange: { _ in }, onEndEditing: {})
+                         onTextChange: { _ in }, onEndEditing: {}, siblings: board.items,
+                         fullResolution: true)
                     .frame(width: item.w, height: item.h)
                     .offset(x: item.x - bounds.minX + padding, y: item.y - bounds.minY + padding)
             }

@@ -7,6 +7,17 @@ struct ItemView: View {
     let isEditing: Bool
     let onTextChange: (String) -> Void
     let onEndEditing: () -> Void
+    /// Resto de piezas del tablero: sólo lo usan las columnas para encontrar su contenido.
+    var siblings: [BoardItem] = []
+    /// Posición de inserción mientras se arrastra algo sobre esta columna (nil = no es el destino).
+    var dropIndex: Int? = nil
+    /// Piezas contenidas que están seleccionadas (se resaltan dentro de la columna).
+    var selectedChildren: Set<UUID> = []
+    /// Clic sobre una pieza contenida: la activa para indicar que se puede sacar.
+    var onChildTap: (UUID) -> Void = { _ in }
+    /// Dibuja a resolución completa en vez de una miniatura dimensionada a pantalla. Lo usa el export
+    /// a PDF, que necesita la foto entera para imprimir nítido; en el lienzo se queda en `false`.
+    var fullResolution: Bool = false
 
     /// Al entrar en edición el cursor ya está dentro: se escribe sin un segundo clic.
     @FocusState private var editorFocused: Bool
@@ -24,6 +35,7 @@ struct ItemView: View {
             case .frame: frameCard
             case .text:  textBlock
             case .board: boardCard
+            case .column: columnCard
             }
         }
         .overlay {
@@ -39,19 +51,54 @@ struct ItemView: View {
     // MARK: - Foto suelta
 
     private var imageCard: some View {
-        picture
+        picture.overlay(alignment: .topTrailing) {
+            UploadBadge(media: item.media)
+                .scaleEffect(1 / scale, anchor: .topTrailing)
+        }
+    }
+
+    /// Lado mayor (en px físicos) al que de verdad se dibuja la foto, para pedir una miniatura a esa
+    /// resolución y no un bitmap enorme. Incluye el zoom de la cámara, la densidad de la pantalla y el
+    /// recorte (si sólo se ve un trozo de la foto, ese trozo necesita más resolución del original).
+    private var targetPixels: Int {
+        let backing = NSScreen.main?.backingScaleFactor ?? 2
+        let cropW = max(item.crop?.width ?? 1, 0.01)
+        let cropH = max(item.crop?.height ?? 1, 0.01)
+        let wPx = item.w * scale * backing / cropW
+        let hPx = item.h * scale * backing / cropH
+        return Int(ceil(max(wPx, hPx)))
     }
 
     @ViewBuilder
     private var picture: some View {
-        if let file = item.media, let img = ImageCache.shared.image(named: file) {
-            CroppedImage(image: img, crop: item.crop ?? CGRect(x: 0, y: 0, width: 1, height: 1),
-                         size: CGSize(width: item.w, height: item.kind == .frame ? item.h - 34 : item.h))
-        } else {
-            Rectangle()
-                .fill(.gray.opacity(0.25))
-                .overlay(Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary))
+        let loaded = item.media.flatMap {
+            fullResolution ? ImageCache.shared.image(named: $0)
+                           : ImageCache.shared.thumbnail(named: $0, maxPixel: targetPixels)
         }
+        ZStack {
+            if let img = loaded {
+                CroppedImage(image: img, crop: item.crop ?? CGRect(x: 0, y: 0, width: 1, height: 1),
+                             size: CGSize(width: item.w, height: item.kind == .frame ? item.h - 34 : item.h))
+                    // La foto recién descargada entra con un leve fundido/zoom en vez de aparecer de golpe.
+                    .transition(.opacity.combined(with: .scale(scale: 1.03)))
+            } else {
+                Rectangle()
+                    .fill(.gray.opacity(0.25))
+                    .overlay {
+                        // Mientras la foto se baja del servidor giramos un indicador; si no hay nada que
+                        // esperar (sin media o sin sincronización) mostramos el marcador de imagen.
+                        if item.media != nil && SyncConfig.isConfigured {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(1 / scale)
+                        } else {
+                            Image(systemName: "photo").font(.largeTitle).foregroundStyle(.secondary)
+                        }
+                    }
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.3), value: loaded != nil)
     }
 
     // MARK: - Nota
@@ -95,8 +142,19 @@ struct ItemView: View {
                 .scrollDisabled(true)
                 .padding(.vertical, TextMetrics.verticalInset)
                 .onExitCommand(perform: onEndEditing)
+                .overlay(alignment: .topLeading) {
+                    // Guía mientras la nota está vacía; desaparece al escribir.
+                    if item.text.isEmpty {
+                        Text("Empieza a escribir…")
+                            .font(item.swiftUIFont)
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, TextMetrics.horizontalInset)
+                            .padding(.vertical, TextMetrics.verticalInset)
+                            .allowsHitTesting(false)
+                    }
+                }
         } else {
-            Text(item.text.isEmpty ? "Escribe…" : item.text)
+            Text(item.text.isEmpty ? "Empieza a escribir…" : item.text)
                 .font(item.swiftUIFont)
                 .foregroundStyle(item.text.isEmpty ? AnyShapeStyle(.secondary) : item.textColor)
                 .padding(.horizontal, TextMetrics.horizontalInset)
@@ -139,6 +197,96 @@ struct ItemView: View {
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(.primary.opacity(0.08)))
     }
 
+    // MARK: - Columna: contenedor organizador
+
+    private var columnCard: some View {
+        let pad = Store.ColumnMetrics.padding
+        let inner = max(item.w - pad * 2, 20)
+        let byID = Dictionary(siblings.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let childItems = (item.children ?? []).compactMap { byID[$0] }
+        let active = dropIndex != nil
+        return VStack(spacing: 0) {
+            columnHeader
+            Divider().opacity(0.3)
+            if childItems.isEmpty {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(active ? Color.accentColor : .secondary.opacity(0.35),
+                                  style: StrokeStyle(lineWidth: 1.5, dash: [5, 4]))
+                    .background(active ? Color.accentColor.opacity(0.08) : .clear)
+                    .overlay(Text("Arrastra elementos hasta acá")
+                        .font(.caption)
+                        .foregroundStyle(active ? Color.accentColor : .secondary))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: Store.ColumnMetrics.empty)
+                    .padding(pad)
+            } else {
+                VStack(spacing: Store.ColumnMetrics.spacing) {
+                    if dropIndex == 0 { insertionBar.transition(.opacity) }
+                    ForEach(Array(childItems.enumerated()), id: \.element.id) { idx, child in
+                        ColumnChildView(child: child, width: inner, scale: scale,
+                                        siblings: siblings,
+                                        isSelected: selectedChildren.contains(child.id),
+                                        fullResolution: fullResolution,
+                                        onTap: { onChildTap(child.id) })
+                            // Al entrar/salir del contenedor la pieza se amplía/reduce con un fundido
+                            // en lugar de aparecer o desaparecer de golpe.
+                            .transition(.scale(scale: 0.6).combined(with: .opacity))
+                        if dropIndex == idx + 1 { insertionBar.transition(.opacity) }
+                    }
+                }
+                .padding(pad)
+            }
+        }
+        // El cambio en la lista de hijos (y el indicador de inserción) se anima: las piezas se
+        // acomodan y la columna crece o se encoge en lugar de dar un salto.
+        .animation(.spring(duration: 0.4, bounce: 0.18), value: item.children)
+        .animation(.easeInOut(duration: 0.18), value: dropIndex)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                // Superficie de tarjeta del sistema: blanca en claro, gris oscuro en oscuro.
+                .fill(Color(nsColor: .controlBackgroundColor))
+                .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+        )
+        .overlay(
+            // Sin borde en reposo: sólo se resalta mientras se arrastra algo encima.
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(active ? Color.accentColor : .clear, lineWidth: active ? 2 : 0)
+        )
+    }
+
+    /// Línea que señala la posición exacta donde caerá lo que se arrastra.
+    private var insertionBar: some View {
+        Capsule()
+            .fill(Color.accentColor)
+            .frame(height: 3)
+            .frame(maxWidth: .infinity)
+    }
+
+    private var columnHeader: some View {
+        Group {
+            if isEditing {
+                TextField("Columna", text: Binding(get: { item.text }, set: onTextChange))
+                    .textFieldStyle(.plain)
+                    .multilineTextAlignment(.center)
+                    .focused($editorFocused)
+                    .onAppear(perform: focusEditor)
+                    .onSubmit(onEndEditing)
+                    .onExitCommand(perform: onEndEditing)
+            } else {
+                Text(item.text.isEmpty ? "Columna" : item.text)
+                    .foregroundStyle(item.text.isEmpty ? .secondary : .primary)
+                    .lineLimit(1)
+            }
+        }
+        .font(.system(size: 13, weight: .semibold))
+        .frame(maxWidth: .infinity, alignment: .center)
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 10)
+        .frame(height: Store.ColumnMetrics.header)
+    }
+
+
     // MARK: - Viñeta de storyboard
 
     private var frameCard: some View {
@@ -169,6 +317,47 @@ struct ItemView: View {
                 .fill(Color(hex: item.colorHex).opacity(0.9))
                 .shadow(color: .black.opacity(0.35), radius: 10, y: 4)
         )
+        .overlay(alignment: .topTrailing) {
+            UploadBadge(media: item.media)
+                .scaleEffect(1 / scale, anchor: .topTrailing)
+                .padding(5)
+        }
+    }
+}
+
+/// Insignia de verificación de subida sobre una foto: gira mientras sube, muestra un visto bueno
+/// al terminar (y se desvanece), un aviso si la subida al servidor falló (toca para reintentar), o
+/// una pausa si se frenó por cuota de almacenamiento (se reintenta sola al liberar espacio).
+private struct UploadBadge: View {
+    let media: String?
+    @ObservedObject private var sync = SyncService.shared
+
+    var body: some View {
+        let state = sync.uploadState(media)
+        ZStack {
+            if let state {
+                Circle().fill(.black.opacity(0.55))
+                switch state {
+                case .uploading:
+                    ProgressView().controlSize(.mini).tint(.white)
+                case .uploaded:
+                    Image(systemName: "checkmark").font(.system(size: 11, weight: .bold)).foregroundStyle(.white)
+                case .failed:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.yellow)
+                case .pausedQuota:
+                    Image(systemName: "pause.fill")
+                        .font(.system(size: 10, weight: .bold)).foregroundStyle(.orange)
+                }
+            }
+        }
+        .frame(width: 22, height: 22)
+        .padding(6)
+        .opacity(state == nil ? 0 : 1)
+        .help(state == .pausedQuota ? "En pausa: se subirá al liberar espacio" : "")
+        .onTapGesture { if state == .failed || state == .pausedQuota, let media { sync.retryUpload(media) } }
+        .allowsHitTesting(state == .failed || state == .pausedQuota)
+        .animation(.easeInOut(duration: 0.25), value: state)
     }
 }
 
@@ -191,5 +380,35 @@ struct CroppedImage: View {
             .offset(x: x, y: y)
             .frame(width: size.width, height: size.height, alignment: .topLeading)
             .clipped()
+    }
+}
+
+/// Pieza dentro de una columna: se dibuja escalada al ancho del contenedor y sin interacción propia.
+/// Arrastrarla la saca del contenedor y la deja suelta en el lienzo siguiendo el cursor (el trabajo
+/// lo hace `BoardCanvas` por callbacks, porque esta vista también se usa al exportar a PDF, sin store).
+private struct ColumnChildView: View {
+    let child: BoardItem
+    let width: Double
+    let scale: Double
+    let siblings: [BoardItem]
+    let isSelected: Bool
+    var fullResolution: Bool = false
+    let onTap: () -> Void
+
+    var body: some View {
+        let f = width / max(child.w, 1)
+        ItemView(item: child, scale: scale * f, isSelected: isSelected, isEditing: false,
+                 onTextChange: { _ in }, onEndEditing: {}, siblings: siblings,
+                 fullResolution: fullResolution)
+            .frame(width: child.w, height: child.h)
+            .scaleEffect(f, anchor: .topLeading)
+            .frame(width: width, height: child.h * f, alignment: .topLeading)
+            .clipped()
+            .allowsHitTesting(false)
+            .contentShape(Rectangle())
+            .onTapGesture { onTap() }
+            // El arrastre para sacar la pieza del contenedor lo conduce el gesto de la columna
+            // (ver `itemDrag` en BoardCanvas): aquí no se añade, porque esta vista desaparece en
+            // cuanto la pieza abandona la columna y cortaría el arrastre a mitad.
     }
 }
