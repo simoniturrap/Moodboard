@@ -7,7 +7,11 @@ struct SyncSettingsSheet: View {
     @ObservedObject private var sync = SyncService.shared
 
     @State private var url = SyncConfig.workerURL
-    @State private var token = SyncConfig.token
+    @State private var email = SyncConfig.email
+    @State private var password = ""
+    @State private var loggedIn = !SyncConfig.token.isEmpty
+    @State private var loginError: String?
+    @State private var busy = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -25,19 +29,48 @@ struct SyncSettingsSheet: View {
                 TextField("https://moodboard-sync.xxx.workers.dev", text: $url)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
-                SecureField("Token", text: $token)
-                    .textFieldStyle(.roundedBorder)
+                    .disabled(loggedIn)
+
+                if loggedIn {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text("Sesión iniciada como **\(SyncConfig.email)**")
+                            .font(.callout)
+                        Spacer()
+                        Button("Cerrar sesión") {
+                            sync.signOut()
+                            loggedIn = false
+                            password = ""
+                        }
+                    }
+                } else {
+                    TextField("Email", text: $email)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .textContentType(.username)
+                    SecureField("Contraseña", text: $password)
+                        .textFieldStyle(.roundedBorder)
+                        .textContentType(.password)
+                        .onSubmit(signIn)
+                    if let loginError {
+                        Text(loginError).font(.caption).foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             HStack(spacing: 10) {
                 Circle().fill(statusColor).frame(width: 8, height: 8)
                 Text(sync.status.label).font(.callout).foregroundStyle(.secondary)
                 Spacer()
-                Button("Guardar y probar", action: saveAndTest)
-                    .keyboardShortcut(.defaultAction)
+                if !loggedIn {
+                    Button("Iniciar sesión", action: signIn)
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(busy || url.isEmpty || email.isEmpty || password.isEmpty)
+                }
             }
 
-            if sync.usageKnown { usageIndicator }
+            if loggedIn && sync.usageKnown { usageIndicator }
 
             HStack {
                 Spacer()
@@ -90,14 +123,23 @@ struct SyncSettingsSheet: View {
         }
     }
 
-    private func saveAndTest() {
-        SyncConfig.workerURL = url
-        SyncConfig.token = token
-        url = SyncConfig.workerURL          // refleja la normalización (sin barra final)
-        sync.refreshEnabledState()
+    private func signIn() {
+        guard !busy, !url.isEmpty, !email.isEmpty, !password.isEmpty else { return }
+        busy = true
+        loginError = nil
         Task {
+            let error = await sync.login(workerURL: url, email: email, password: password)
+            busy = false
+            if let error {
+                loginError = error
+                return
+            }
+            url = SyncConfig.workerURL       // refleja la normalización (sin barra final)
+            password = ""
+            loggedIn = true
             await sync.testConnection()
             if SyncConfig.isConfigured { await store.resync() }
+            await sync.refreshUsage()
         }
     }
 }

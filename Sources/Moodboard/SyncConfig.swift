@@ -23,6 +23,12 @@ enum SyncConfig {
         set { writeToken(newValue.trimmingCharacters(in: .whitespacesAndNewlines)) }
     }
 
+    /// Email con el que se inició sesión (no es secreto; sólo para mostrarlo y rellenar el campo).
+    static var email: String {
+        get { UserDefaults.standard.string(forKey: "sync.email") ?? "" }
+        set { UserDefaults.standard.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), forKey: "sync.email") }
+    }
+
     static var isConfigured: Bool {
         !workerURL.isEmpty && !token.isEmpty && URL(string: workerURL) != nil
     }

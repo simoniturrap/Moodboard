@@ -59,6 +59,72 @@ function authorized(request: Request, env: Env): boolean {
   return tokenMatches(header.slice(prefix.length), env.SYNC_TOKEN);
 }
 
+// ---------------------------------------------------------------------------
+// Autenticación (una sola cuenta): email + contraseña -> token de sync.
+// La contraseña se guarda derivada con PBKDF2-SHA256; nunca en claro.
+// ---------------------------------------------------------------------------
+
+const PBKDF2_ITERATIONS = 100_000;
+
+function bufToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf);
+  let s = "";
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function base64ToBytes(b64: string): Uint8Array {
+  const s = atob(b64);
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+
+async function derivePassword(password: string, salt: Uint8Array, iterations: number): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", salt, iterations, hash: "SHA-256" }, key, 256);
+  return bufToBase64(bits);
+}
+
+/** Comparación en tiempo constante (no filtra por timing si cuántos chars coinciden). */
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+/** Fija (o cambia) el email y la contraseña de la cuenta. Protegido por el token de sync. */
+async function setupAuth(request: Request, env: Env): Promise<Response> {
+  const { email, password } = (await request.json()) as { email?: string; password?: string };
+  if (!email || !password) return text("Faltan email o password", 400);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await derivePassword(password, salt, PBKDF2_ITERATIONS);
+  await env.DB.prepare(
+    "INSERT INTO auth (id, email, pw_hash, pw_salt, iterations) VALUES (1, ?1, ?2, ?3, ?4) " +
+    "ON CONFLICT(id) DO UPDATE SET email = ?1, pw_hash = ?2, pw_salt = ?3, iterations = ?4")
+    .bind(email.trim().toLowerCase(), hash, bufToBase64(salt.buffer), PBKDF2_ITERATIONS)
+    .run();
+  return json({ ok: true });
+}
+
+/** Valida email+contraseña y, si cuadran, devuelve el token de sync para que la app lo guarde. */
+async function login(request: Request, env: Env): Promise<Response> {
+  const { email, password } = (await request.json()) as { email?: string; password?: string };
+  if (!email || !password) return text("Faltan email o password", 400);
+  const row = await env.DB.prepare(
+    "SELECT email, pw_hash, pw_salt, iterations FROM auth WHERE id = 1")
+    .first<{ email: string; pw_hash: string; pw_salt: string; iterations: number }>();
+  if (!row) return text("No hay cuenta configurada", 401);
+  const candidate = await derivePassword(password, base64ToBytes(row.pw_salt), row.iterations);
+  const ok = constantTimeEqual(candidate, row.pw_hash)
+    && email.trim().toLowerCase() === row.email;
+  if (!ok) return text("Credenciales inválidas", 401);
+  return json({ token: env.SYNC_TOKEN });
+}
+
 /** Nombre de archivo de media seguro: UUID.ext, sin rutas ni trucos. */
 function safeMediaName(name: string): string | null {
   const decoded = decodeURIComponent(name);
@@ -93,8 +159,18 @@ export default {
         return getFont(env, segments[1], method);
       }
 
+      // ---- Login público: email+contraseña -> token de sync ------------
+      if (segments[0] === "login" && segments.length === 1 && method === "POST") {
+        return login(request, env);
+      }
+
       // ---- A partir de aquí todo exige el token compartido -------------
       if (!authorized(request, env)) return text("Unauthorized", 401);
+
+      // ---- /auth/setup : fija o cambia la contraseña (requiere token) --
+      if (segments[0] === "auth" && segments[1] === "setup" && segments.length === 2 && method === "POST") {
+        return setupAuth(request, env);
+      }
 
       // ---- /library ----------------------------------------------------
       if (segments.length === 1 && segments[0] === "library") {

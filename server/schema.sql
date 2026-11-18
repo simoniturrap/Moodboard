@@ -16,3 +16,14 @@ CREATE TABLE IF NOT EXISTS shared (
   board_id   TEXT NOT NULL UNIQUE,
   created_at TEXT NOT NULL
 );
+
+-- Credenciales de la única cuenta (id siempre = 1). La contraseña se guarda derivada
+-- con PBKDF2-SHA256 (nunca en claro). Al iniciar sesión, el Worker valida y entrega el
+-- token de sync, que es lo que la app usa luego para todas las peticiones.
+CREATE TABLE IF NOT EXISTS auth (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  email      TEXT NOT NULL,
+  pw_hash    TEXT NOT NULL,
+  pw_salt    TEXT NOT NULL,
+  iterations INTEGER NOT NULL
+);

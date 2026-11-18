@@ -74,6 +74,42 @@ final class SyncService: ObservableObject {
         else if status == .disabled { status = .idle }
     }
 
+    /// Inicia sesión contra el Worker: manda email+contraseña a `/login` y, si cuadran, guarda la URL,
+    /// el email y el token devuelto (en el Keychain). La contraseña no se guarda. Devuelve `nil` si
+    /// todo fue bien, o un mensaje de error listo para mostrar.
+    func login(workerURL: String, email: String, password: String) async -> String? {
+        let base = workerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = base.hasSuffix("/") ? String(base.dropLast()) : base
+        guard let url = URL(string: clean + "/login") else { return "La URL del servidor no es válida." }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["email": email, "password": password])
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return "El servidor no respondió." }
+            if http.statusCode == 401 { return "Email o contraseña incorrectos." }
+            guard http.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let token = obj["token"] as? String, !token.isEmpty else {
+                return "El servidor respondió con un error (\(http.statusCode))."
+            }
+            SyncConfig.workerURL = clean
+            SyncConfig.email = email
+            SyncConfig.token = token
+            refreshEnabledState()
+            return nil
+        } catch {
+            return "No se pudo conectar: \(error.localizedDescription)"
+        }
+    }
+
+    /// Cierra la sesión en este equipo: borra el token (y por tanto desactiva la sincronización).
+    func signOut() {
+        SyncConfig.token = ""
+        refreshEnabledState()
+    }
+
     // MARK: - Tipos del protocolo HTTP
 
     private struct PutRequest: Encodable { let baseRevision: Int; let json: String }
