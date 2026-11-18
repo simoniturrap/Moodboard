@@ -33,7 +33,32 @@ npx wrangler deploy
 
 Al desplegar verás la URL del Worker, p. ej.
 `https://moodboard-sync.tu-subdominio.workers.dev`.
-Esa URL y el token son lo que se pega en la app, en **Moodboard → Sincronización…**.
+
+```bash
+# 7. Crear tu cuenta (email + contraseña) con la que iniciarás sesión en la app.
+#    El token autoriza este alta; la contraseña se guarda derivada con PBKDF2, nunca en claro.
+curl -s -X POST https://moodboard-sync.tu-subdominio.workers.dev/auth/setup \
+  -H "Authorization: Bearer tu-token" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"tu@email.com","password":"tu-contraseña"}'
+# -> {"ok":true}
+```
+
+En la app, en **Moodboard → Sincronización…**, pegas la URL del Worker e inicias sesión con
+ese email y contraseña (el token queda por debajo, no hace falta teclearlo).
+
+## Cuenta y login
+
+Una sola cuenta (uso personal). La contraseña vive en la tabla `auth` de D1, derivada con
+PBKDF2-SHA256; el Worker nunca la guarda ni la devuelve en claro.
+
+```
+POST /login        <- { email, password }  -> { token }        (público; valida y entrega el token)
+POST /auth/setup   <- { email, password }  -> { ok: true }     (requiere el token; fija o cambia la cuenta)
+```
+
+Para **cambiar la contraseña**, repite el paso 7 con la nueva. Si la olvidas, igual: el token
+(en tu Llavero / como secreto del Worker) es lo que autoriza el cambio.
 
 ## Carga inicial opcional
 

@@ -92,13 +92,19 @@ El editor es una hoja con formato estándar (carta, Courier 12, márgenes de 1,5
 ## Sincronización y compartir
 
 La app funciona en local sin configurar nada. Si querés sincronizar entre
-dispositivos y compartir tableros por enlace, desplegás el Worker de Cloudflare
-(D1 + R2) que está en [`server/`](server/README.md) y cargás la URL y el token en
-**Ajustes → Sincronización**. El token se guarda en el Keychain; no hay ningún
-secreto en el repositorio.
+dispositivos, desplegás el Worker de Cloudflare (D1 + R2) que está en
+[`server/`](server/README.md) y creás tu cuenta (una sola, de uso personal).
+
+En **Ajustes → Sincronización** cargás la URL del servidor e **iniciás sesión con tu
+email y contraseña**. La app valida contra el Worker y guarda el token resultante en el
+Keychain; a partir de ahí sincroniza sola. En otro Mac, el mismo login te muestra tus
+mismas mesas de trabajo. No hay ningún secreto en el repositorio.
+
+El alta de la cuenta y el cambio de contraseña se hacen una vez desde la terminal; están
+documentados en [`server/README.md`](server/README.md).
 
 Un tablero compartido genera un enlace público de sólo lectura que se ve en vivo
-desde el navegador, sin necesidad de la app ni del token.
+desde el navegador, sin necesidad de la app ni de iniciar sesión.
 
 ## Dónde viven los datos
 

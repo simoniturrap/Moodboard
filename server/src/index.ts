@@ -4,6 +4,10 @@
  * API REST mínima para sincronizar la biblioteca de Moodboard entre los equipos
  * de un mismo usuario. Protegida por un token compartido (secreto SYNC_TOKEN).
  *
+ * Cuenta (una sola, uso personal):
+ *   POST   /login             <- { email, password } -> { token }    (público: valida y da el token)
+ *   POST   /auth/setup        <- { email, password } -> { ok }       (requiere token: fija/cambia la cuenta)
+ *
  *   GET    /library            -> { revision, json }  | 404 si aún no hay nada
  *   PUT    /library            <- { baseRevision, json }
  *                                 200 { revision } si baseRevision coincide (o primer push)
