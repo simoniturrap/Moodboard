@@ -265,6 +265,11 @@ struct BoardCanvas: View {
             Text("Arrastra fotos desde el Finder · ⌘V para pegar · doble clic para una nota")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+            if let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+                Text("Versión \(version)")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
         }
         .allowsHitTesting(false)
     }
