@@ -4,6 +4,7 @@ import AppKit
 @main
 struct MoodboardApp: App {
     @StateObject private var store = Store()
+    @StateObject private var updater = UpdaterController()
     @AppStorage(themePreferenceKey) private var theme = ThemePreference.system.rawValue
 
     var body: some Scene {
@@ -16,6 +17,10 @@ struct MoodboardApp: App {
         }
         .windowToolbarStyle(.unified)
         .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Buscar actualizaciones…") { updater.checkForUpdates() }
+                    .disabled(!updater.canCheckForUpdates)
+            }
             CommandGroup(replacing: .newItem) {
                 Button("Nuevo tablero…") { store.requestNew(.board) }
                     .keyboardShortcut("n")
