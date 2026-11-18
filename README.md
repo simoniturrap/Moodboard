@@ -2,12 +2,27 @@
 
 App nativa de macOS (SwiftUI) para armar moodboards de fotografía, storyboards y guiones de cine.
 
-## Correr
+## Descargar
+
+La app lista para usar está en [Releases](https://github.com/simoniturrap/Moodboard/releases/latest)
+(`Moodboard-x.y.z.zip`). Requiere un Mac con Apple Silicon y macOS 14 o superior.
+
+La app está firmada *ad-hoc* (sin cuenta de Apple), así que la **primera** vez macOS avisa que no
+puede verificar al desarrollador. Para abrirla:
+
+> **Clic derecho** sobre `Moodboard.app` → **Abrir** → **Abrir**.
+
+Sólo hace falta la primera vez. A partir de ahí, la app se **actualiza sola**: Sparkle avisa cuando
+hay una versión nueva y la instala (validada con firma EdDSA), sin volver a pasar por ese paso. También
+podés buscar actualizaciones a mano desde el menú **Moodboard → Buscar actualizaciones…**.
+
+## Correr desde el código
 
 ```bash
 swift run              # desarrollo, rápido
-./build.sh             # arma dist/Moodboard.app
+./build.sh             # arma dist/Moodboard.app (con Sparkle embebido)
 open dist/Moodboard.app
+./release.sh           # compila, firma, genera el appcast y publica un release
 ```
 
 También podés abrir `Package.swift` con Xcode y darle ▶.
