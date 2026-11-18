@@ -4,9 +4,23 @@ Backend de sincronización: guarda el estado **actual** de la biblioteca de Mood
 (`library.json`, incluida la papelera) en **D1**, y las imágenes en **R2**. Gratis para
 este uso (R2: 10 GB sin coste de descarga; D1: 5 GB).
 
-## Puesta en marcha (una sola vez)
+## Puesta en marcha rápida (un comando)
 
-Necesitas una cuenta de Cloudflare (gratis). Desde esta carpeta:
+Necesitas una cuenta de Cloudflare (gratis) y Node. Desde esta carpeta:
+
+```bash
+cd server
+npm install
+./deploy.sh
+```
+
+`deploy.sh` crea la base D1 y el bucket R2, aplica el esquema, genera un token, despliega el
+Worker e imprime la **URL** y el **token de configuración**. Con esos dos datos te registras
+desde la app (pestaña **Registrarse**) eligiendo tu email y contraseña. Listo.
+
+## Puesta en marcha manual (una sola vez)
+
+Si prefieres hacerlo paso a paso en lugar de usar `deploy.sh`:
 
 ```bash
 cd server

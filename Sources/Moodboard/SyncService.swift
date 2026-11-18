@@ -34,6 +34,8 @@ final class SyncService: ObservableObject {
     static let storageCap: Int64 = 9_500_000_000
 
     @Published private(set) var status: Status = .disabled
+    /// Hay una sesión iniciada en este equipo (hay token guardado). Lo observa la pantalla de entrada.
+    @Published private(set) var loggedIn: Bool = !SyncConfig.token.isEmpty
     /// Cambia cada vez que llega una imagen nueva, para que las vistas que la esperaban se redibujen.
     @Published private(set) var mediaTick = 0
     /// Subidas en curso o recién terminadas, por nombre de archivo (para la insignia sobre la foto).
@@ -97,6 +99,7 @@ final class SyncService: ObservableObject {
             SyncConfig.workerURL = clean
             SyncConfig.email = email
             SyncConfig.token = token
+            loggedIn = true
             refreshEnabledState()
             return nil
         } catch {
@@ -104,9 +107,35 @@ final class SyncService: ObservableObject {
         }
     }
 
+    /// Da de alta la cuenta en el propio servidor (primera vez) y, si sale bien, inicia sesión.
+    /// El `setupToken` es el secreto SYNC_TOKEN que se fijó al desplegar el Worker: autoriza el alta.
+    /// Devuelve `nil` si todo fue bien, o un mensaje de error para mostrar.
+    func register(workerURL: String, setupToken: String, email: String, password: String) async -> String? {
+        let base = workerURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let clean = base.hasSuffix("/") ? String(base.dropLast()) : base
+        let token = setupToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: clean + "/auth/setup") else { return "La URL del servidor no es válida." }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["email": email, "password": password])
+        do {
+            let (_, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse else { return "El servidor no respondió." }
+            if http.statusCode == 401 { return "Token de configuración incorrecto." }
+            guard http.statusCode == 200 else { return "El servidor respondió con un error (\(http.statusCode))." }
+        } catch {
+            return "No se pudo conectar: \(error.localizedDescription)"
+        }
+        // Cuenta creada: ahora inicia sesión para obtener y guardar el token de sync.
+        return await login(workerURL: clean, email: email, password: password)
+    }
+
     /// Cierra la sesión en este equipo: borra el token (y por tanto desactiva la sincronización).
     func signOut() {
         SyncConfig.token = ""
+        loggedIn = false
         refreshEnabledState()
     }
 

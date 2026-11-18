@@ -91,17 +91,18 @@ El editor es una hoja con formato estándar (carta, Courier 12, márgenes de 1,5
 
 ## Sincronización y compartir
 
-La app funciona en local sin configurar nada. Si querés sincronizar entre
-dispositivos, desplegás el Worker de Cloudflare (D1 + R2) que está en
-[`server/`](server/README.md) y creás tu cuenta (una sola, de uso personal).
+Moodboard es de código libre y **cada quien usa su propio Cloudflare**: desplegás tu
+backend (gratis) y tus tableros y fotos viven en *tu* cuenta, no en un servidor de
+terceros. La app es el cliente; vos sos el dueño de los datos.
 
-En **Ajustes → Sincronización** cargás la URL del servidor e **iniciás sesión con tu
-email y contraseña**. La app valida contra el Worker y guarda el token resultante en el
-Keychain; a partir de ahí sincroniza sola. En otro Mac, el mismo login te muestra tus
-mismas mesas de trabajo. No hay ningún secreto en el repositorio.
+**Montar tu servidor** (una sola vez): con una cuenta de Cloudflare, desde `server/`
+corrés `./deploy.sh`. Crea la base D1, el bucket R2 y publica el Worker, y te da la **URL**
+y un **token de configuración**. Detalle en [`server/README.md`](server/README.md).
 
-El alta de la cuenta y el cambio de contraseña se hacen una vez desde la terminal; están
-documentados en [`server/README.md`](server/README.md).
+**Entrar en la app**: al abrir, la pantalla de inicio te deja **registrarte** (URL + token
+de configuración + email + contraseña) o **iniciar sesión** (URL + email + contraseña). La
+app guarda el token en el Keychain y sincroniza sola; en otro Mac, el mismo login te muestra
+tus mismas mesas de trabajo. También podés elegir **usar la app en local, sin cuenta**.
 
 Un tablero compartido genera un enlace público de sólo lectura que se ve en vivo
 desde el navegador, sin necesidad de la app ni de iniciar sesión.

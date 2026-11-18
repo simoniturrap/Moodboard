@@ -113,8 +113,19 @@ struct MoodboardApp: App {
 
 struct RootView: View {
     @EnvironmentObject var store: Store
+    @ObservedObject private var sync = SyncService.shared
+    /// El usuario eligió usar la app en local, sin cuenta: se salta la pantalla de entrada.
+    @AppStorage("useLocalOnly") private var useLocalOnly = false
 
     var body: some View {
+        if !sync.loggedIn && !useLocalOnly {
+            ConnectView(useLocalOnly: $useLocalOnly)
+        } else {
+            appContent
+        }
+    }
+
+    private var appContent: some View {
         Group {
             if store.activeBoard == nil {
                 HomeView()
