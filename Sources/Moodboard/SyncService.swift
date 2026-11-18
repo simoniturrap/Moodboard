@@ -55,6 +55,9 @@ final class SyncService: ObservableObject {
     var onMediaArrived: (() -> Void)?
 
     private var pushTask: Task<Void, Never>?
+    /// Reintento de una subida que falló por red; se reprograma solo hasta que logre salir.
+    private var retryTask: Task<Void, Never>?
+    private let pushRetryDelay = 5.0
     /// Serialización de subidas: `isPushing` marca que hay una en curso; `pendingPush` es
     /// la versión más reciente esperando a que termine la actual.
     private var isPushing = false
@@ -182,6 +185,15 @@ final class SyncService: ObservableObject {
         }
     }
 
+    /// Empuja ya mismo, sin esperar el retraso. Para usar al cerrar/suspender la app: así los cambios
+    /// salen de este equipo antes de apagarlo, en vez de quedarse esperando el debounce.
+    func pushImmediately(_ library: Library) {
+        guard SyncConfig.isConfigured else { return }
+        pushTask?.cancel()
+        retryTask?.cancel()
+        Task { [weak self] in await self?.pushNow(library) }
+    }
+
     /// Serializa las subidas: nunca hay dos a la vez. Si llega un cambio mientras se sube,
     /// se guarda como pendiente y se envía justo después, ya con la revisión actualizada.
     /// Así una subida no "pisa" a otra basándose en una revisión vieja (lo que antes hacía
@@ -212,15 +224,29 @@ final class SyncService: ObservableObject {
                     SyncConfig.knownRevision = r.revision
                 }
                 conflictRetries = 0
+                retryTask?.cancel()   // salió bien: cancela cualquier reintento en espera
                 status = .upToDate
                 await reconcile(referenced: Self.referencedMedia(library))
             case 409:
                 handleConflict(data, local: library)
             default:
                 status = .error("HTTP \(code)")
+                scheduleRetry(library)
             }
         } catch {
             status = .error(error.localizedDescription)
+            scheduleRetry(library)   // típico sin red: reintenta solo hasta que vuelva la conexión
+        }
+    }
+
+    /// Reprograma una subida que falló (p. ej. sin red), para que acabe saliendo sin que el usuario
+    /// tenga que hacer nada. La cola serializada evita que choque con una subida nueva.
+    private func scheduleRetry(_ library: Library) {
+        retryTask?.cancel()
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(self?.pushRetryDelay ?? 5.0))
+            guard !Task.isCancelled else { return }
+            await self?.pushNow(library)
         }
     }
 

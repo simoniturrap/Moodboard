@@ -81,6 +81,13 @@ final class Store: ObservableObject {
     /// datos locales no puede pisar lo que el servidor sí tenga.
     private let loadedFromDisk: Bool
 
+    /// Hay un pull+fusión en curso (arranque o enfoque de la ventana): evita que se solapen dos.
+    private var isSyncInFlight = false
+    /// El arranque (que decide con cuidado si adoptar o fusionar según haya datos locales fiables) ya
+    /// corrió. Hasta entonces, el refresco al enfocar no actúa: fusionar el tablero de relleno con el
+    /// servidor podría subir basura.
+    private var didBootstrap = false
+
     init() {
         if let data = try? Data(contentsOf: Store.libraryFile),
            let decoded = try? JSONDecoder().decode(Library.self, from: data) {
@@ -92,6 +99,12 @@ final class Store: ObservableObject {
         }
         // Sin tablero activo (se cerraron todas las pestañas) la app abre en la vista de inicio.
         library.trash.removeAll { $0.deletedAt.timeIntervalSinceNow < -trashMaxAge }
+        // Poda las lápidas de borrado más antiguas que la papelera: pasado ese plazo, dejan de hacer falta.
+        let tombCutoff = Date().addingTimeInterval(-trashMaxAge)
+        library.deletedBoardIDs = library.deletedBoardIDs?.filter { $0.value > tombCutoff }
+        for i in library.boards.indices {
+            library.boards[i].deletedItemIDs = library.boards[i].deletedItemIDs?.filter { $0.value > tombCutoff }
+        }
         let existing = Set(library.boards.map(\.id))
         library.openBoardIDs = library.openBoardIDs.filter(existing.contains)
         if let active = library.activeBoardID, !existing.contains(active) { library.activeBoardID = nil }
@@ -106,6 +119,65 @@ final class Store: ObservableObject {
         // Al llegar una imagen del servidor, redibujar las vistas (que observan el Store).
         sync.onMediaArrived = { [weak self] in self?.objectWillChange.send() }
         Task { await bootstrapSync() }
+        registerLifecycleObservers()
+    }
+
+    /// Reduce la pérdida de datos entre equipos enganchando la sincronización al ciclo de vida:
+    ///  - al activarse la ventana (volver a la app, cambiar de app y volver): baja y fusiona lo del
+    ///    servidor, para ver lo que hiciste en el otro equipo *antes* de ponerte a editar;
+    ///  - al desactivarse / cerrar / dormir el equipo: empuja ya lo pendiente, sin esperar el retraso
+    ///    habitual, para que tus cambios salgan de este equipo antes de apagarlo.
+    private func registerLifecycleObservers() {
+        let nc = NotificationCenter.default
+        nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in await self?.refreshFromServer() }
+        }
+        for name in [NSApplication.willResignActiveNotification, NSApplication.willTerminateNotification] {
+            nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.flush() }
+            }
+        }
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.flush() }
+        }
+    }
+
+    /// Fuerza que lo pendiente llegue al disco y al servidor ya mismo (sin el retraso habitual).
+    func flush() {
+        saveTask?.cancel()
+        saveNow()                       // escribe a disco y agenda el push
+        sync.pushImmediately(library)   // y lo empuja sin esperar
+    }
+
+    /// Baja la biblioteca del servidor y la fusiona con la local. Sólo reemplaza lo que esté en
+    /// pantalla si algo cambió de verdad (así no se pierde la selección al enfocar la ventana) y
+    /// conserva el encuadre local de cada tablero (no da saltos la vista). No interrumpe una edición
+    /// de texto en curso.
+    func refreshFromServer() async {
+        guard SyncConfig.isConfigured, didBootstrap, !isSyncInFlight, editingItem == nil else { return }
+        isSyncInFlight = true
+        defer { isSyncInFlight = false }
+        guard let (remote, revision) = await sync.pull() else { return }
+        var merged = library.merged(with: remote)
+        // Conserva el encuadre (cámara) local de cada tablero: lo de otro equipo no mueve tu vista.
+        for i in merged.boards.indices {
+            if let local = library.boards.first(where: { $0.id == merged.boards[i].id }) {
+                merged.boards[i].camera = local.camera
+            }
+        }
+        let localBehind = merged.boards != library.boards || merged.trash != library.trash
+        let serverBehind = merged.boards != remote.boards || merged.trash != remote.trash
+        if localBehind {
+            // La fusión trae algo nuevo: instálala (y súbela si el servidor también va por detrás).
+            installFromSync(merged, revision: revision, pushBack: serverBehind)
+            await sync.reconcile(referenced: SyncService.referencedMedia(library))
+        } else {
+            SyncConfig.knownRevision = revision
+            // Lo local ya estaba al día; si el servidor va por detrás (cambios que nunca subieron, o
+            // una subida que falló), súbele la unión ahora.
+            if serverBehind { await sync.pushNow(merged) }
+        }
     }
 
     // MARK: - Sincronización
@@ -167,7 +239,9 @@ final class Store: ObservableObject {
     /// que, con un servidor vacío a una revisión mayor, borraba todo el contenido). Luego concilia
     /// las imágenes.
     private func bootstrapSync() async {
-        guard SyncConfig.isConfigured else { return }
+        guard SyncConfig.isConfigured, !isSyncInFlight else { return }
+        isSyncInFlight = true
+        defer { isSyncInFlight = false; didBootstrap = true }
         if let (remote, revision) = await sync.pull() {
             if loadedFromDisk {
                 // Disco + servidor se funden; subimos la unión para que el servidor quede igual.
@@ -197,8 +271,11 @@ final class Store: ObservableObject {
         let existing = Set(library.boards.map(\.id))
         library.openBoardIDs = library.openBoardIDs.filter(existing.contains)
         if let active = library.activeBoardID, !existing.contains(active) { library.activeBoardID = nil }
-        selection = []
-        editingItem = nil
+        // Conserva lo que esté seleccionado/editándose si sigue existiendo tras la fusión (así un
+        // refresco al enfocar la ventana no te quita la selección sin motivo).
+        let liveItems = Set(activeBoard?.items.map(\.id) ?? [])
+        selection = selection.intersection(liveItems)
+        if let editing = editingItem, !liveItems.contains(editing) { editingItem = nil }
         saveLocalOnly()
         if pushBack { Task { await sync.pushNow(library) } }
     }
@@ -568,6 +645,11 @@ final class Store: ObservableObject {
     /// Borra tableros y todo lo que cuelga de ellos, cerrando sus pestañas.
     private func removeBoardSubtrees(_ roots: Set<UUID>) {
         let all = descendantBoardIDs(of: roots)
+        // Lápidas: registra el borrado para que la fusión no resucite estos tableros en otro equipo.
+        let now = Date()
+        var tombs = library.deletedBoardIDs ?? [:]
+        for id in all { tombs[id.uuidString] = now }
+        library.deletedBoardIDs = tombs
         library.openBoardIDs.removeAll { all.contains($0) }
         if let active = library.activeBoardID, all.contains(active) { library.activeBoardID = nil }
         library.boards.removeAll { all.contains($0.id) }
@@ -686,6 +768,7 @@ final class Store: ObservableObject {
         mutateBoard { board in
             guard let i = board.items.firstIndex(where: { $0.id == id }) else { return }
             change(&board.items[i])
+            board.items[i].modifiedAt = Date()   // sella la pieza para fusionar por pieza entre equipos
         }
     }
 
@@ -704,6 +787,11 @@ final class Store: ObservableObject {
             })
         }
         mutateBoard { board in
+            // Lápidas: registra el borrado para que la fusión con otro equipo no resucite estas piezas.
+            let now = Date()
+            var tombs = board.deletedItemIDs ?? [:]
+            for id in ids { tombs[id.uuidString] = now }
+            board.deletedItemIDs = tombs
             board.items.removeAll { ids.contains($0.id) }
             // Si lo borrado estaba dentro de una columna, quita también la referencia (no quedan ids colgando).
             for i in board.items.indices { board.items[i].children?.removeAll { ids.contains($0) } }
@@ -1051,13 +1139,18 @@ final class Store: ObservableObject {
         library.trash.removeAll { $0.id == entryID }
         switch entry.content {
         case .board(let board):
-            library.boards.append(board)
-            select(board: board.id)
+            var revived = board
+            revived.modifiedAt = Date()               // renace más nuevo que su lápida (gana la fusión)
+            library.deletedBoardIDs?[revived.id.uuidString] = nil
+            library.boards.append(revived)
+            select(board: revived.id)
         case .item(let item, let boardID, _):
             if library.boards.contains(where: { $0.id == boardID }) { select(board: boardID) }
             mutateBoard { board in
+                board.deletedItemIDs?[item.id.uuidString] = nil   // retira su lápida: ya no está borrada
                 var new = item
                 new.z = board.topZ
+                new.modifiedAt = Date()               // renace más nueva que su lápida (gana la fusión)
                 board.items.append(new)
             }
             selection = [item.id]

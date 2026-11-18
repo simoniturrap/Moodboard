@@ -104,6 +104,18 @@ de configuración + email + contraseña) o **iniciar sesión** (URL + email + co
 app guarda el token en el Keychain y sincroniza sola; en otro Mac, el mismo login te muestra
 tus mismas mesas de trabajo. También podés elegir **usar la app en local, sin cuenta**.
 
+La sincronización está pensada para **no perder trabajo** cuando usás dos equipos:
+
+- **Fusión a nivel de pieza.** Si editás el mismo tablero en dos Macs, los cambios de cada
+  uno conviven: no se pisa el tablero entero. Cada pieza se resuelve por separado (gana la
+  edición más reciente de *esa* pieza) y lo que borraste queda borrado (lápidas de borrado,
+  para que la fusión no resucite nada).
+- **Tus cambios salen al cerrar.** Al cambiar de app, cerrar la ventana o dormir el equipo, lo
+  pendiente se sube de inmediato (sin esperar el retraso del guardado). Si falla por falta de
+  red, se reintenta solo hasta que vuelve la conexión.
+- **Bajás lo del otro equipo al volver.** Al reactivar la ventana, la app baja y fusiona lo que
+  haya en el servidor *antes* de que sigas editando, para reducir los conflictos.
+
 Un tablero compartido genera un enlace público de sólo lectura que se ve en vivo
 desde el navegador, sin necesidad de la app ni de iniciar sesión.
 

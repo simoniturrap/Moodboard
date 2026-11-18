@@ -84,6 +84,10 @@ struct BoardItem: Identifiable, Codable, Hashable {
     var childBoardID: UUID?
     /// Piezas contenidas, en orden de arriba a abajo (sólo en contenedores `.column`).
     var children: [UUID]?
+    /// Última modificación de esta pieza. Permite fusionar los cambios de dos equipos pieza por
+    /// pieza (gana la versión más reciente de cada una), en vez de que el tablero más nuevo pise
+    /// el entero. nil = pieza de un archivo antiguo (se trata como la más vieja posible).
+    var modifiedAt: Date? = Date()
 
     var origin: CGPoint {
         get { CGPoint(x: x, y: y) }
@@ -127,6 +131,10 @@ struct Board: Identifiable, Codable, Hashable {
     var parentID: UUID?
     /// Nombre de archivo de la imagen usada como portada del enlace compartido (nil = la primera foto).
     var cover: String?
+    /// Lápidas: piezas (y notas) borradas de este tablero, con la fecha del borrado. Evitan que la
+    /// fusión con otro equipo resucite algo que ya habías eliminado. Se podan por antigüedad (como la
+    /// papelera). Clave = UUID de la pieza en texto.
+    var deletedItemIDs: [String: Date]?
 
     var isScript: Bool { kind == .script }
     var isNotes: Bool { kind == .notes }
@@ -307,6 +315,9 @@ struct Library: Codable {
     var trash: [TrashEntry] = []
     /// Tableros abiertos como pestañas, en orden.
     var openBoardIDs: [UUID] = []
+    /// Lápidas de tableros borrados, con su fecha: evitan que la fusión resucite un tablero que ya
+    /// eliminaste en otro equipo. Clave = UUID del tablero en texto.
+    var deletedBoardIDs: [String: Date]?
 
     static var starter: Library {
         let board = Board(name: "Mi primer tablero")
@@ -322,37 +333,120 @@ extension Library {
         activeBoardID = try c.decodeIfPresent(UUID.self, forKey: .activeBoardID)
         trash = try c.decodeIfPresent([TrashEntry].self, forKey: .trash) ?? []
         openBoardIDs = try c.decodeIfPresent([UUID].self, forKey: .openBoardIDs) ?? []
+        deletedBoardIDs = try c.decodeIfPresent([String: Date].self, forKey: .deletedBoardIDs)
     }
 
-    /// Une esta biblioteca con otra **sin perder tableros**: los que existen en ambas se quedan con
-    /// la versión modificada más recientemente; los que sólo están en una se conservan. La papelera
-    /// se une por id. Es la pieza que hace la sincronización no-destructiva: ni un servidor vacío
-    /// puede vaciar el disco, ni el disco puede vaciar el servidor al adoptar su versión.
-    /// Mantiene el estado de interfaz local (pestañas y tablero activo).
+    /// Une esta biblioteca con otra **sin perder trabajo**, con la granularidad de la pieza (no del
+    /// tablero entero). Reglas:
+    ///  - Un tablero presente en ambas se fusiona pieza por pieza (ver `mergeBoards`); el que sólo
+    ///    está en una se conserva, salvo que el otro lado tenga una lápida de borrado posterior a su
+    ///    última edición.
+    ///  - Las lápidas (piezas y tableros borrados) impiden resucitar lo que ya se eliminó.
+    ///  - La papelera se une por id.
+    /// Así ni un servidor vacío puede vaciar el disco, ni dos equipos que editan el mismo tablero se
+    /// pisan el trabajo: las piezas que cada uno añadió conviven. Mantiene el estado de interfaz local.
     func merged(with other: Library) -> Library {
+        let boardTombs = Self.mergeDateMaps(deletedBoardIDs, other.deletedBoardIDs)
+
         var winner: [UUID: Board] = [:]
         for board in boards { winner[board.id] = board }
         for board in other.boards {
             if let mine = winner[board.id] {
-                if board.lastModified > mine.lastModified { winner[board.id] = board }
+                winner[board.id] = Self.mergeBoards(mine, board)
             } else {
                 winner[board.id] = board
+            }
+        }
+        // Aplica las lápidas: quita un tablero sólo si se borró *después* de su última modificación
+        // (si se volvió a editar más tarde, es que renació y se conserva).
+        for (idStr, deletedAt) in boardTombs {
+            if let id = UUID(uuidString: idStr), let b = winner[id], b.lastModified <= deletedAt {
+                winner.removeValue(forKey: id)
             }
         }
         // Orden estable: primero los tableros locales en su orden; luego los que sólo trae el otro.
         var order: [UUID] = []
         var seen: Set<UUID> = []
         for board in boards + other.boards where seen.insert(board.id).inserted {
-            order.append(board.id)
+            if winner[board.id] != nil { order.append(board.id) }
         }
         var result = self
         result.boards = order.compactMap { winner[$0] }
+        // Conserva sólo las lápidas de tableros que sigan muertos (poda las de los revividos).
+        let liveBoardTombs = boardTombs.filter { idStr, _ in
+            guard let id = UUID(uuidString: idStr) else { return false }
+            return winner[id] == nil
+        }
+        result.deletedBoardIDs = liveBoardTombs.isEmpty ? nil : liveBoardTombs
         // Papelera: unión por id, conservando primero la local.
         var trashSeen = Set(trash.map(\.id))
         for entry in other.trash where trashSeen.insert(entry.id).inserted {
             result.trash.append(entry)
         }
         return result
+    }
+
+    /// Fusiona dos versiones del mismo tablero. Los metadatos (nombre, cámara, portada, guion) vienen
+    /// del que se editó más recientemente; las piezas y las notas se unen por id, ganando la versión
+    /// más reciente de cada una y respetando las lápidas de borrado de ambos lados.
+    static func mergeBoards(_ mine: Board, _ theirs: Board) -> Board {
+        var result = mine.lastModified >= theirs.lastModified ? mine : theirs
+
+        // --- Piezas: unión por id ---
+        var byID: [UUID: BoardItem] = [:]
+        var order: [UUID] = []
+        for item in mine.items + theirs.items where byID[item.id] == nil { order.append(item.id) }
+        for item in mine.items { byID[item.id] = item }
+        for item in theirs.items {
+            if let cur = byID[item.id] {
+                if date(item.modifiedAt) > date(cur.modifiedAt) { byID[item.id] = item }
+            } else {
+                byID[item.id] = item
+            }
+        }
+        let itemTombs = mergeDateMaps(mine.deletedItemIDs, theirs.deletedItemIDs)
+        for (idStr, deletedAt) in itemTombs {
+            if let id = UUID(uuidString: idStr), let item = byID[id], date(item.modifiedAt) <= deletedAt {
+                byID.removeValue(forKey: id)
+            }
+        }
+        result.items = order.compactMap { byID[$0] }
+        let liveTombs = itemTombs.filter { idStr, _ in
+            guard let id = UUID(uuidString: idStr) else { return false }
+            return byID[id] == nil
+        }
+        result.deletedItemIDs = liveTombs.isEmpty ? nil : liveTombs
+
+        // --- Notas (gestor de notas): unión por id, gana la más reciente ---
+        if mine.notes != nil || theirs.notes != nil {
+            var notesByID: [UUID: Note] = [:]
+            var notesOrder: [UUID] = []
+            for note in (mine.notes ?? []) + (theirs.notes ?? []) where notesByID[note.id] == nil {
+                notesOrder.append(note.id)
+            }
+            for note in mine.notes ?? [] { notesByID[note.id] = note }
+            for note in theirs.notes ?? [] {
+                if let cur = notesByID[note.id] {
+                    if note.modifiedAt > cur.modifiedAt { notesByID[note.id] = note }
+                } else {
+                    notesByID[note.id] = note
+                }
+            }
+            result.notes = notesOrder.compactMap { notesByID[$0] }
+        }
+        return result
+    }
+
+    /// Fecha de una pieza para comparar; nil (archivo antiguo) se trata como la más vieja posible.
+    private static func date(_ value: Date?) -> Date { value ?? .distantPast }
+
+    /// Une dos mapas de lápidas conservando, por clave, la fecha más reciente.
+    static func mergeDateMaps(_ a: [String: Date]?, _ b: [String: Date]?) -> [String: Date] {
+        var out = a ?? [:]
+        for (key, value) in b ?? [:] {
+            if let cur = out[key] { if value > cur { out[key] = value } } else { out[key] = value }
+        }
+        return out
     }
 }
 

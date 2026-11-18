@@ -13,7 +13,7 @@ struct MoodboardApp: App {
                 .environmentObject(store)
                 .frame(minWidth: 900, minHeight: 600)
                 .preferredColorScheme((ThemePreference(rawValue: theme) ?? .system).colorScheme)
-                .onDisappear { store.saveNow() }
+                .onDisappear { store.flush() }
         }
         .windowToolbarStyle(.unified)
         .commands {
