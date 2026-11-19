@@ -105,6 +105,10 @@ final class Store: ObservableObject {
         for i in library.boards.indices {
             library.boards[i].deletedItemIDs = library.boards[i].deletedItemIDs?.filter { $0.value > tombCutoff }
         }
+        // Repara en el acto documentos inflados por duplicación (versión vieja del sync): colapsa las
+        // piezas con id repetido. Se persiste más abajo para no rehacerlo en cada arranque y para que
+        // la versión limpia acabe subiendo al servidor.
+        let healedDuplicates = loadedFromDisk && library.dedupeItems()
         let existing = Set(library.boards.map(\.id))
         library.openBoardIDs = library.openBoardIDs.filter(existing.contains)
         if let active = library.activeBoardID, !existing.contains(active) { library.activeBoardID = nil }
@@ -120,6 +124,9 @@ final class Store: ObservableObject {
         sync.onMediaArrived = { [weak self] in self?.objectWillChange.send() }
         Task { await bootstrapSync() }
         registerLifecycleObservers()
+        // Guarda ya el documento reparado (y lo encola para subir), para no rehacer la limpieza en
+        // cada arranque y para sanear también la copia del servidor.
+        if healedDuplicates { saveNow() }
     }
 
     /// Reduce la pérdida de datos entre equipos enganchando la sincronización al ciclo de vida:
@@ -673,7 +680,8 @@ final class Store: ObservableObject {
         copy.openedAt = nil
         if rename { copy.name = source.name + " copia" }
         // Ids nuevos para cada pieza, reapuntando los hijos de las columnas a las copias.
-        let idMap = Dictionary(uniqueKeysWithValues: source.items.map { ($0.id, UUID()) })
+        // `uniquingKeysWith` (en vez de `uniqueKeysWithValues`) evita abortar si hubiera ids repetidos.
+        let idMap = Dictionary(source.items.map { ($0.id, UUID()) }, uniquingKeysWith: { first, _ in first })
         copy.items = source.items.map { item in
             var c = item
             c.id = idMap[item.id] ?? UUID()
@@ -1091,7 +1099,12 @@ final class Store: ObservableObject {
 
     /// Si el original está a la vista, la copia aparece desplazada 20 px por pegado;
     /// si no, se centra en lo que se está viendo.
-    private func pasteItems(_ items: [BoardItem]) {
+    private func pasteItems(_ rawItems: [BoardItem]) {
+        // Descarta piezas con id repetido antes de reasignar ids, por si el portapapeles trae
+        // duplicados (documentos heredados): así no se vuelven a crear piezas con el mismo id.
+        var seenIDs: Set<UUID> = []
+        let items = rawItems.filter { seenIDs.insert($0.id).inserted }
+        guard !items.isEmpty else { return }
         let bounds = items.dropFirst().reduce(items[0].frameRect) { $0.union($1.frameRect) }
         pasteCount += 1
         var dx = 20 * Double(pasteCount), dy = dx
@@ -1101,7 +1114,8 @@ final class Store: ObservableObject {
         }
         checkpoint()
         // Ids nuevos para todas las piezas; las columnas conservan su contenido reapuntando a las copias.
-        let idMap = Dictionary(uniqueKeysWithValues: items.map { ($0.id, UUID()) })
+        // `uniquingKeysWith` (en vez de `uniqueKeysWithValues`) evita abortar si llegaran ids repetidos.
+        let idMap = Dictionary(items.map { ($0.id, UUID()) }, uniquingKeysWith: { first, _ in first })
         let claimed = Set(items.flatMap { $0.children ?? [] }.compactMap { idMap[$0] })
         var topLevel: Set<UUID> = []
         mutateBoard { board in

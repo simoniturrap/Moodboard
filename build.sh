@@ -12,8 +12,8 @@ CONFIG="${1:-release}"
 APP="dist/Moodboard.app"
 
 # Versión mostrada y número de compilación (Sparkle compara CFBundleVersion para decidir updates).
-SHORT_VERSION="${SHORT_VERSION:-1.4.0}"
-BUILD_VERSION="${BUILD_VERSION:-5}"
+SHORT_VERSION="${SHORT_VERSION:-1.4.1}"
+BUILD_VERSION="${BUILD_VERSION:-6}"
 
 # Feed del appcast y clave pública EdDSA (la privada vive en el Keychain de quien publica).
 SU_FEED_URL="${SU_FEED_URL:-https://github.com/simoniturrap/Moodboard/releases/latest/download/appcast.xml}"

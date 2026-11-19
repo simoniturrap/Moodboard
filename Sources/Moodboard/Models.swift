@@ -372,6 +372,9 @@ extension Library {
         }
         var result = self
         result.boards = order.compactMap { winner[$0] }
+        // Red de seguridad: colapsa piezas con id repetido (corrupción heredada). Los tableros que
+        // sólo están en un lado no pasan por `mergeBoards`, así que podrían llegar con duplicados.
+        _ = result.dedupeItems()
         // Conserva sólo las lápidas de tableros que sigan muertos (poda las de los revividos).
         let liveBoardTombs = boardTombs.filter { idStr, _ in
             guard let id = UUID(uuidString: idStr) else { return false }
@@ -439,6 +442,34 @@ extension Library {
 
     /// Fecha de una pieza para comparar; nil (archivo antiguo) se trata como la más vieja posible.
     private static func date(_ value: Date?) -> Date { value ?? .distantPast }
+
+    /// Repara datos heredados: colapsa piezas con el mismo id dentro de cada tablero, conservando por
+    /// id la versión más reciente (y, en empate, la primera). Una versión vieja del sync concatenaba
+    /// las piezas sin deduplicar, duplicándolas en cada ronda (×2, ×4, … hasta miles): eso inflaba el
+    /// documento (lentitud) y dejaba ids repetidos que hacían abortar el pegar/clonar. Devuelve `true`
+    /// si eliminó algún duplicado.
+    @discardableResult
+    mutating func dedupeItems() -> Bool {
+        var changed = false
+        for i in boards.indices {
+            let items = boards[i].items
+            var byID: [UUID: BoardItem] = [:]
+            var order: [UUID] = []
+            for item in items {
+                if let cur = byID[item.id] {
+                    if Self.date(item.modifiedAt) > Self.date(cur.modifiedAt) { byID[item.id] = item }
+                } else {
+                    byID[item.id] = item
+                    order.append(item.id)
+                }
+            }
+            if order.count != items.count {
+                boards[i].items = order.compactMap { byID[$0] }
+                changed = true
+            }
+        }
+        return changed
+    }
 
     /// Une dos mapas de lápidas conservando, por clave, la fecha más reciente.
     static func mergeDateMaps(_ a: [String: Date]?, _ b: [String: Date]?) -> [String: Date] {
