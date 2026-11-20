@@ -96,6 +96,7 @@ struct TrashSheet: View {
             let firstLine = item.text.split(separator: "\n").first.map(String.init) ?? ""
             switch item.kind {
             case .image: return "Imagen"
+            case .video: return "Video"
             case .note:  return firstLine.isEmpty ? "Nota" : firstLine
             case .frame: return firstLine.isEmpty ? "Viñeta" : "Viñeta: " + firstLine
             case .text:  return firstLine.isEmpty ? "Nota" : firstLine

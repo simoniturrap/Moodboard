@@ -1,0 +1,43 @@
+.mb-capture-btn {
+  position: absolute;
+  z-index: 2147483647;
+  width: 32px;
+  height: 32px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  margin: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(20, 20, 22, 0.82);
+  color: #fff;
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  transition: transform 0.12s ease, background 0.12s ease;
+}
+
+.mb-capture-btn.mb-visible {
+  display: flex;
+}
+
+.mb-capture-btn:hover {
+  transform: scale(1.08);
+  background: rgba(20, 20, 22, 0.95);
+}
+
+.mb-capture-btn.mb-busy {
+  background: rgba(20, 20, 22, 0.95);
+}
+
+.mb-capture-btn.mb-ok {
+  background: #34c759;
+}
+
+.mb-capture-btn.mb-err {
+  background: #ff3b30;
+}

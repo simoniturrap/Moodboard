@@ -4,6 +4,7 @@ import CoreGraphics
 /// Tipo de pieza que vive en un tablero.
 enum ItemKind: String, Codable {
     case image      // foto suelta
+    case video      // video corto con reproductor embebido
     case note       // nota de papel de color (en desuso: sólo para tableros antiguos)
     case frame      // viñeta de storyboard: imagen + pie de texto
     case text       // nota de texto sin fondo
@@ -307,6 +308,21 @@ struct TrashEntry: Identifiable, Codable, Hashable {
     var id = UUID()
     var deletedAt = Date()
     var content: Content
+}
+
+/// Una captura esperando en la bandeja de entrada del servidor (p. ej. recortada desde Instagram con
+/// la extensión de Chrome). Vive sólo en el servidor, no en el documento sincronizado: la app la baja
+/// para mostrarla y, al cargarla en un tablero, se convierte en una `BoardItem` normal y se consume.
+struct InboxItem: Identifiable, Codable, Hashable {
+    let id: String
+    let media: String
+    var sourceUrl: String?
+    var kind: String = "image"
+    var w: Int?
+    var h: Int?
+    var createdAt: String?
+
+    var isVideo: Bool { kind == "video" }
 }
 
 struct Library: Codable {

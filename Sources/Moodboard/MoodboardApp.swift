@@ -79,6 +79,7 @@ struct MoodboardApp: App {
                 // ⌫ lo resuelve BoardCanvas según dónde se hizo clic (pieza o tablero).
                 Button("Eliminar selección") { store.deleteSelection() }
                 Button("Papelera…") { store.isShowingTrash = true }
+                Button("Bandeja de entrada…") { store.isShowingInbox = true }
             }
         }
 
@@ -147,6 +148,7 @@ struct RootView: View {
         }
         .sheet(isPresented: $store.isNamingNewBoard) { NewBoardSheet() }
         .sheet(isPresented: $store.isShowingTrash) { TrashSheet() }
+        .sheet(isPresented: $store.isShowingInbox) { InboxSheet() }
         .sheet(isPresented: $store.isShowingSync) { SyncSettingsSheet() }
         .sheet(isPresented: $store.isShowingShare) { ShareSheet() }
     }

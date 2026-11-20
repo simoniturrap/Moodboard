@@ -17,6 +17,8 @@ struct BoardCanvas: View {
     @State private var dragAxis: Axis?
     /// Columna bajo lo que se arrastra y posición de inserción: resalta la zona y dibuja el indicador.
     @State private var dropTarget: (column: UUID, index: Int)?
+    /// Carpeta (`.board`) bajo lo que se arrastra: la resalta y, al soltar, absorbe lo arrastrado.
+    @State private var folderTarget: UUID?
     @State private var marquee: CGRect?
     /// Origen (en el tablero) de una pieza que se está sacando de una columna por arrastre.
     @State private var childDragBase: CGPoint?
@@ -40,6 +42,14 @@ struct BoardCanvas: View {
 
     private func toWorld(_ p: CGPoint) -> CGPoint {
         CGPoint(x: (p.x - camera.x) / scale, y: (p.y - camera.y) / scale)
+    }
+
+    /// true si el punto (en coordenadas del viewport) cae sobre la cabecera de la columna: la única
+    /// zona que agarra/selecciona el contenedor. El cuerpo deja interactuar con las piezas de dentro.
+    private func columnHeaderContains(_ item: BoardItem, at viewportPoint: CGPoint) -> Bool {
+        let w = toWorld(viewportPoint)
+        return w.x >= item.x && w.x <= item.x + item.w
+            && w.y >= item.y && w.y <= item.y + Store.ColumnMetrics.header
     }
 
     /// Le dice al Store qué parte del tablero se ve, para decidir dónde pegar.
@@ -114,7 +124,7 @@ struct BoardCanvas: View {
                 .padding(20)
             }
             .overlay(alignment: .bottomLeading) {
-                TrashButton().padding(20)
+                HStack(spacing: 10) { InboxButton(); TrashButton() }.padding(20)
             }
             .overlay(alignment: .trailing) {
                 // Sin selección: herramientas. Con algo seleccionado: opciones de ese elemento.
@@ -147,7 +157,7 @@ struct BoardCanvas: View {
                         .allowsHitTesting(false)
                 }
             }
-            .onDrop(of: [UTType.image, UTType.fileURL, UTType.url, UTType.utf8PlainText], isTargeted: $isTargeted) { providers, location in
+            .onDrop(of: [UTType.image, UTType.movie, UTType.fileURL, UTType.url, UTType.utf8PlainText], isTargeted: $isTargeted) { providers, location in
                 handleDrop(providers, at: toWorld(location))
                 return true
             }
@@ -188,11 +198,24 @@ struct BoardCanvas: View {
                          onEndEditing: { store.editingItem = nil },
                          siblings: board?.items ?? [],
                          dropIndex: dropTarget?.column == item.id ? dropTarget?.index : nil,
+                         folderTargeted: folderTarget == item.id,
                          selectedChildren: store.selection,
                          onChildTap: { id in
                              store.focusArea = .canvas
                              store.editingItem = nil
                              store.selection = [id]
+                         },
+                         onChildOpen: { id in
+                             // Doble clic sobre una pieza dentro de una columna: igual que en el lienzo.
+                             guard let child = board?.items.first(where: { $0.id == id }) else { return }
+                             switch child.kind {
+                             case .image:
+                                 withAnimation(.spring(duration: 0.3, bounce: 0.12)) { store.lightboxItem = id }
+                             case .board:
+                                 store.openBoardFolder(child)
+                             default:
+                                 break   // el video reproduce con su propio control; el resto no abre nada
+                             }
                          })
                     .frame(width: item.w, height: item.h)
                     // Una columna que recalcula su alto al ganar o perder contenido crece/encoge
@@ -200,19 +223,29 @@ struct BoardCanvas: View {
                     .animation(item.kind == .column ? .spring(duration: 0.4, bounce: 0.18) : nil,
                                value: item.h)
                     .gesture(itemDrag(item))
-                    .simultaneousGesture(TapGesture().onEnded { select(item) })
-                    .simultaneousGesture(TapGesture(count: 2).onEnded {
+                    // En una columna sólo la cabecera interactúa con el contenedor; el cuerpo deja pasar
+                    // los toques a cada pieza de dentro (que llevan sus propios gestos).
+                    .simultaneousGesture(SpatialTapGesture(coordinateSpace: .named("viewport")).onEnded { value in
+                        if item.kind == .column && !columnHeaderContains(item, at: value.location) { return }
+                        select(item)
+                    })
+                    .simultaneousGesture(SpatialTapGesture(count: 2, coordinateSpace: .named("viewport")).onEnded { value in
                         switch item.kind {
                         case .image:
                             withAnimation(.spring(duration: 0.3, bounce: 0.12)) { store.lightboxItem = item.id }
                         case .board:
                             store.openBoardFolder(item)
+                        case .video:
+                            break   // el reproductor embebido maneja play/pausa; el doble clic no hace nada
+                        case .column:
+                            if columnHeaderContains(item, at: value.location) { store.editingItem = item.id }
                         default:
                             store.editingItem = item.id
                         }
                     })
                     .contextMenu {
                         if item.kind == .image { imageMenu(item) }
+                        if item.kind == .video { videoMenu(item) }
                         if item.kind == .board { boardMenu(item) }
                         if item.kind == .column { columnMenu(item) }
                     }
@@ -324,6 +357,9 @@ struct BoardCanvas: View {
                 // que la pieza abandone el contenedor; el de la pieza desaparecía con ella.
                 if dragOrigins.isEmpty && childDragID == nil && item.kind == .column {
                     childDragID = store.childID(in: item.id, at: toWorld(value.startLocation))
+                    // El cuerpo (fuera de la cabecera y sin empezar sobre una pieza) no mueve la columna:
+                    // así el cuerpo queda libre para interactuar con lo que hay dentro.
+                    if childDragID == nil && !columnHeaderContains(item, at: value.startLocation) { return }
                 }
                 if let child = childDragID {
                     childDragChanged(child, start: value.startLocation,
@@ -366,12 +402,33 @@ struct BoardCanvas: View {
                 // Resalta la columna que se solapa con lo arrastrado (basta tocar una esquina) y
                 // calcula dónde entraría según la altura del cursor/centro.
                 let draggedIDs = Set(dragOrigins.keys)
-                if let primary = board?.items.first(where: { $0.id == (dragPrimary ?? item.id) }),
-                   let target = store.columnID(overlapping: primary.frameRect, excluding: draggedIDs) {
+                if let primary = board?.items.first(where: { $0.id == (dragPrimary ?? item.id) }) {
                     let center = CGPoint(x: primary.frameRect.midX, y: primary.frameRect.midY)
-                    dropTarget = (target, store.dropIndex(in: target, at: center))
+                    if primary.kind == .column {
+                        // Una columna arrastrada sólo se reubica: no anida en otra columna ni la traga una
+                        // carpeta por rozarla con su marco (grande) al moverla. Si no, desaparecía al mover.
+                        dropTarget = nil
+                        folderTarget = nil
+                    } else if primary.kind == .board {
+                        // Una carpeta sólo entra en un contenedor si se suelta claramente dentro (su centro
+                        // sobre él). Así moverla rozando una columna u otra carpeta no la hace desaparecer.
+                        if let target = store.columnID(at: center), !draggedIDs.contains(target) {
+                            dropTarget = (target, store.dropIndex(in: target, at: center))
+                            folderTarget = nil
+                        } else {
+                            dropTarget = nil
+                            folderTarget = store.boardFolderID(at: center, excluding: draggedIDs)
+                        }
+                    } else if let target = store.columnID(overlapping: primary.frameRect, excluding: draggedIDs) {
+                        dropTarget = (target, store.dropIndex(in: target, at: center))
+                        folderTarget = nil
+                    } else {
+                        dropTarget = nil
+                        folderTarget = store.boardFolderID(overlapping: primary.frameRect, excluding: draggedIDs)
+                    }
                 } else {
                     dropTarget = nil
+                    folderTarget = nil
                 }
             }
             .onEnded { _ in
@@ -402,10 +459,14 @@ struct BoardCanvas: View {
                 }
                 // Soltar sobre una columna mete ahí lo arrastrado (organizador), en la posición marcada.
                 let draggedIDs = Array(dragOrigins.keys)
-                if let target = dropTarget, !draggedIDs.contains(target.column) {
+                if let folder = folderTarget, !draggedIDs.contains(folder) {
+                    // Soltar sobre una carpeta mueve lo arrastrado a su sub-tablero.
+                    store.moveToFolder(Set(draggedIDs), folderItemID: folder)
+                } else if let target = dropTarget, !draggedIDs.contains(target.column) {
                     store.claim(draggedIDs, into: target.column, at: target.index)
                 }
                 dropTarget = nil
+                folderTarget = nil
                 dragOrigins = [:]
                 dragPrimary = nil
                 dragAxis = nil
@@ -431,17 +492,21 @@ struct BoardCanvas: View {
             if let target = store.columnID(overlapping: moved.frameRect, excluding: [id]) {
                 let center = CGPoint(x: moved.frameRect.midX, y: moved.frameRect.midY)
                 dropTarget = (target, store.dropIndex(in: target, at: center))
+                folderTarget = nil
             } else {
                 dropTarget = nil
+                folderTarget = store.boardFolderID(overlapping: moved.frameRect, excluding: [id])
             }
         }
     }
 
     /// Soltó la pieza sacada: si cae sobre una columna entra ahí; si no, se imanta a la retícula.
     private func childDragEnded(_ id: UUID) {
-        defer { childDragBase = nil; dropTarget = nil }
+        defer { childDragBase = nil; dropTarget = nil; folderTarget = nil }
         guard board?.items.contains(where: { $0.id == id }) == true else { return }
-        if let target = dropTarget {
+        if let folder = folderTarget, folder != id {
+            store.moveToFolder([id], folderItemID: folder)
+        } else if let target = dropTarget {
             store.claim([id], into: target.column, at: target.index)
         } else {
             withAnimation(.easeOut(duration: 0.12)) {
@@ -503,6 +568,17 @@ struct BoardCanvas: View {
         Divider()
         Button(store.isCover(item.id) ? "Quitar de portada" : "Usar como portada") { store.setCover(item.id) }
         Button("Descargar…") { store.downloadImage(item.id) }
+    }
+
+    /// Clic derecho sobre un video: copiar/mover/duplicar/descargar/eliminar (sin recorte ni portada).
+    @ViewBuilder
+    private func videoMenu(_ item: BoardItem) -> some View {
+        Button("Copiar") { target(item); store.copySelection() }
+        Button("Cortar") { target(item); store.cutSelection() }
+        Button("Duplicar") { target(item); store.duplicateSelection() }
+        Divider()
+        Button("Descargar…") { store.downloadImage(item.id) }
+        Button("Eliminar", role: .destructive) { target(item); store.deleteSelection() }
     }
 
     /// Clic derecho sobre una carpeta: abrir el sub-tablero o renombrarla.
@@ -818,6 +894,10 @@ struct BoardCanvas: View {
                 Label("Viñeta", systemImage: "rectangle.on.rectangle")
             }
             .help("Agregar viñeta de storyboard")
+            Button { store.importVideosWithPanel(at: viewportCenterInWorld) } label: {
+                Label("Video", systemImage: "film")
+            }
+            .help("Agregar videos")
             Spacer()
             Button { setZoom(camera.scale / 1.25) } label: { Image(systemName: "minus.magnifyingglass") }
                 .help("Alejar")

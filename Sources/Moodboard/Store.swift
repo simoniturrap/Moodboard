@@ -3,6 +3,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import ImageIO
+import AVFoundation
 
 /// Fuente de verdad de la app: tableros en memoria, JSON + imágenes en disco.
 @MainActor
@@ -21,6 +22,11 @@ final class Store: ObservableObject {
     /// Tipo de documento que propone la modal de «Nuevo…».
     @Published var newDocumentKind: DocumentKind = .board
     @Published var isShowingTrash = false
+    /// Bandeja de entrada: capturas que esperan en el servidor para cargarse en un tablero.
+    @Published var isShowingInbox = false
+    @Published var inboxItems: [InboxItem] = []
+    /// Cascada de las piezas que se van cargando desde la bandeja, para que no caigan unas sobre otras.
+    private var inboxPlaceCount = 0
     /// Modal de ajustes de sincronización con el servidor.
     @Published var isShowingSync = false
     /// Hoja de "Compartir tablero" con el enlace público.
@@ -137,7 +143,10 @@ final class Store: ObservableObject {
     private func registerLifecycleObservers() {
         let nc = NotificationCenter.default
         nc.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in await self?.refreshFromServer() }
+            Task { @MainActor in
+                await self?.refreshFromServer()
+                await self?.refreshInbox()   // ver lo recién capturado con la extensión sin reabrir la app
+            }
         }
         for name in [NSApplication.willResignActiveNotification, NSApplication.willTerminateNotification] {
             nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
@@ -265,6 +274,7 @@ final class Store: ObservableObject {
         }
         await sync.refreshUsage()   // conoce la cuota antes de reconciliar (para el freno de subidas)
         await sync.reconcile(referenced: SyncService.referencedMedia(library))
+        await refreshInbox()
     }
 
     /// Instala una biblioteca venida del servidor (ya fusionada o adoptada tal cual), la guarda en
@@ -625,6 +635,55 @@ final class Store: ObservableObject {
         select(board: child)
     }
 
+    /// Mueve piezas sueltas del tablero activo al sub-tablero de una carpeta (arrastrar y soltar encima).
+    /// Conserva sus ids y sus medios; escribe lápidas en el origen para que la fusión con otro equipo no
+    /// las resucite, y retira la posible lápida en el destino. Una columna movida se lleva su contenido;
+    /// una carpeta movida reapunta el `parentID` de su propio sub-tablero al destino.
+    func moveToFolder(_ ids: Set<UUID>, folderItemID: UUID) {
+        guard let board = activeBoard,
+              let folder = board.items.first(where: { $0.id == folderItemID }),
+              folder.kind == .board, let childID = folder.childBoardID,
+              let childIndex = library.boards.firstIndex(where: { $0.id == childID }) else { return }
+        // Nunca la propia carpeta; e incluye los hijos de las columnas movidas, para que lleguen completas.
+        var included = ids
+        included.remove(folderItemID)
+        for item in board.items where included.contains(item.id) && item.kind == .column {
+            included.formUnion(item.children ?? [])
+        }
+        let moving = board.items.filter { included.contains($0.id) }
+        guard !moving.isEmpty else { return }
+        checkpoint()
+        let movingIDs = Set(moving.map(\.id))
+        // Reapunta los sub-tableros de las carpetas movidas al nuevo padre (migas de pan correctas).
+        for item in moving where item.kind == .board {
+            if let gc = item.childBoardID, let i = library.boards.firstIndex(where: { $0.id == gc }) {
+                library.boards[i].parentID = childID
+            }
+        }
+        // Quita del tablero activo con lápidas y limpia referencias de columnas que las contuvieran.
+        mutateBoard { board in
+            let now = Date()
+            var tombs = board.deletedItemIDs ?? [:]
+            for id in movingIDs { tombs[id.uuidString] = now }
+            board.deletedItemIDs = tombs
+            board.items.removeAll { movingIDs.contains($0.id) }
+            for i in board.items.indices { board.items[i].children?.removeAll { movingIDs.contains($0) } }
+        }
+        for column in (activeBoard?.items ?? []) where column.kind == .column { refitColumnHeight(column.id) }
+        // Añade al sub-tablero, re-sellando cada pieza y retirando su lápida allí si la tuviera.
+        var z = library.boards[childIndex].topZ
+        for item in moving {
+            var new = item
+            new.modifiedAt = Date()
+            new.z = z; z += 1
+            library.boards[childIndex].deletedItemIDs?[item.id.uuidString] = nil
+            library.boards[childIndex].items.append(new)
+        }
+        library.boards[childIndex].modifiedAt = Date()
+        selection = []
+        scheduleSave()
+    }
+
     /// Cadena de carpetas padre de un tablero, de la raíz a su contenedor directo (para las migas de pan).
     func ancestors(of id: UUID) -> [Board] {
         var chain: [Board] = []
@@ -921,7 +980,7 @@ final class Store: ObservableObject {
                 switch board.items[i].kind {
                 case .text: board.items[i].textColorHex = hex
                 case .note, .frame: board.items[i].colorHex = hex
-                case .image, .board, .column: break
+                case .image, .video, .board, .column: break
                 }
             }
         }
@@ -1214,6 +1273,40 @@ final class Store: ObservableObject {
         }
     }
 
+    // MARK: - Bandeja de entrada
+
+    /// Baja del servidor la lista de capturas que esperan en la bandeja. Reinicia la cascada de
+    /// colocación para que la próxima tanda que se cargue empiece centrada.
+    func refreshInbox() async {
+        guard SyncConfig.isConfigured else { return }
+        if let items = await sync.fetchInbox() { inboxItems = items }
+        inboxPlaceCount = 0
+    }
+
+    /// Carga una captura de la bandeja en el tablero activo: baja su imagen, la coloca como una pieza
+    /// normal y la consume del servidor (conservando el archivo, que la biblioteca pasa a usar).
+    func importFromInbox(_ item: InboxItem) {
+        guard activeBoard != nil else { return }
+        let base = visibleWorldRect.isEmpty ? .zero : CGPoint(x: visibleWorldRect.midX, y: visibleWorldRect.midY)
+        let step = Double(inboxPlaceCount) * 26
+        inboxPlaceCount += 1
+        let point = base + CGPoint(x: step, y: step)
+        inboxItems.removeAll { $0.id == item.id }   // respuesta inmediata en la bandeja
+        Task {
+            guard await sync.downloadMedia(item.media) else { return }
+            add(item.isVideo ? videoItem(fileName: item.media, at: point)
+                             : imageItem(fileName: item.media, at: point, kind: .image))
+            await sync.deleteInboxItem(item.id, discardMedia: false)
+        }
+    }
+
+    /// Descarta una captura sin cargarla: la borra del servidor (y su imagen de R2) y del disco local.
+    func discardInboxItem(_ item: InboxItem) {
+        inboxItems.removeAll { $0.id == item.id }
+        try? FileManager.default.removeItem(at: Store.mediaDir.appendingPathComponent(item.media))
+        Task { await sync.deleteInboxItem(item.id, discardMedia: true) }
+    }
+
     // MARK: - Importar imágenes
 
     /// Suelta piezas arrastradas al lienzo (Finder, navegador u otras apps), en cascada.
@@ -1231,14 +1324,27 @@ final class Store: ObservableObject {
         if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
                 guard let url, url.isFileURL else { return }
+                let kind: ItemKind = Store.isMovie(url) ? .video : .image
                 Task.detached(priority: .userInitiated) {
                     guard let name = Store.storeMedia(copyingFrom: url) else { return }
-                    await self.placeImported(name, at: point, kind: .image)
+                    await self.placeImported(name, at: point, kind: kind)
                 }
             }
             return
         }
-        // 2) Datos de imagen (navegador, apps): tiff, png, jpeg, heic… También fuera de main.
+        // 2) Datos de video (apps que entregan el archivo como datos, no como URL de Finder).
+        if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .movie) == true }) {
+            provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+                guard let data else { return }
+                let ext = UTType(type)?.preferredFilenameExtension ?? "mp4"
+                Task.detached(priority: .userInitiated) {
+                    guard let name = Store.storeMedia(data: data, ext: ext) else { return }
+                    await self.placeImported(name, at: point, kind: .video)
+                }
+            }
+            return
+        }
+        // 3) Datos de imagen (navegador, apps): tiff, png, jpeg, heic… También fuera de main.
         if let type = provider.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
             provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
                 guard let data else { return }
@@ -1270,8 +1376,14 @@ final class Store: ObservableObject {
     /// Inserta en el tablero una imagen ya guardada en el almacén (la copia a disco ya se hizo fuera
     /// del hilo principal) y lanza su subida al servidor. El tamaño se lee de la cabecera, sin decodificar.
     private func placeImported(_ fileName: String, at point: CGPoint, kind: ItemKind) {
-        add(imageItem(fileName: fileName, at: point, kind: kind))
+        add(kind == .video ? videoItem(fileName: fileName, at: point) : imageItem(fileName: fileName, at: point, kind: kind))
         Task { await sync.uploadMedia(fileName, tracked: true) }
+    }
+
+    /// true si la URL apunta a un archivo de video (por su UTType). Sólo mira la extensión: apto para fondo.
+    nonisolated static func isMovie(_ url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.pathExtension.lowercased()) else { return false }
+        return type.conforms(to: .movie) || type.conforms(to: .audiovisualContent)
     }
 
     /// Copia una imagen al almacén y devuelve la pieza lista para colocar.
@@ -1337,6 +1449,30 @@ final class Store: ObservableObject {
                          y: Grid.snap(point.y - h / 2),
                          w: w, h: h,
                          media: fileName)
+    }
+
+    /// Pieza de video: entra con el ancho fijo de las fotos y el alto según la proporción real del video
+    /// (leída de su primera pista); 16:9 de reserva si no se puede medir.
+    private func videoItem(fileName: String, at point: CGPoint) -> BoardItem {
+        let url = Store.mediaDir.appendingPathComponent(fileName)
+        let natural = Store.videoSize(of: url) ?? CGSize(width: 320, height: 180)
+        let w = Grid.imageWidth
+        let h = Grid.snap(w * natural.height / max(natural.width, 1))
+        return BoardItem(kind: .video,
+                         x: Grid.snap(point.x - w / 2),
+                         y: Grid.snap(point.y - h / 2),
+                         w: w, h: h,
+                         media: fileName)
+    }
+
+    /// Dimensiones visibles del video (ancho×alto) leyendo la primera pista; respeta la transformación de
+    /// orientación. nil si no se puede medir. Sólo lectura de metadatos: apto para fondo.
+    nonisolated static func videoSize(of url: URL) -> CGSize? {
+        let asset = AVURLAsset(url: url)
+        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
+        let size = track.naturalSize.applying(track.preferredTransform)
+        let s = CGSize(width: abs(size.width), height: abs(size.height))
+        return (s.width > 0 && s.height > 0) ? s : nil
     }
 
     private func copyIntoMedia(_ url: URL) -> String? {
@@ -1460,6 +1596,13 @@ final class Store: ObservableObject {
         static let padding: Double = 10     // margen interior alrededor del contenido
         static let spacing: Double = 8      // separación entre piezas apiladas
         static let empty: Double = 70       // alto de la zona vacía «arrastra aquí»
+        static let boardRow: Double = 44    // alto fijo de una carpeta en una columna (fila compacta)
+    }
+
+    /// Alto de la fila que ocupa una pieza dentro de una columna de ancho interior `inner`. Las carpetas
+    /// usan una fila compacta de alto fijo (icono + nombre al lado); el resto se ajusta a su proporción.
+    func childRowHeight(_ child: BoardItem, inner: Double) -> Double {
+        child.kind == .board ? ColumnMetrics.boardRow : child.h * inner / max(child.w, 1)
     }
 
     /// Alto que necesita una columna para su cabecera y las piezas que contiene, a la retícula.
@@ -1472,7 +1615,7 @@ final class Store: ObservableObject {
             body = ColumnMetrics.empty
         } else {
             for (i, child) in items.enumerated() {
-                body += child.h * inner / max(child.w, 1)
+                body += childRowHeight(child, inner: inner)
                 if i > 0 { body += ColumnMetrics.spacing }
             }
         }
@@ -1502,6 +1645,24 @@ final class Store: ObservableObject {
         return best?.id
     }
 
+    /// Carpeta (`.board`) cuyo marco contiene el punto dado (para soltar algo dentro con precisión).
+    func boardFolderID(at point: CGPoint, excluding: Set<UUID> = []) -> UUID? {
+        activeBoard?.items.first { $0.kind == .board && !excluding.contains($0.id) && $0.frameRect.contains(point) }?.id
+    }
+
+    /// Carpeta (`.board`) cuyo marco **se solapa** con `rect` (la de mayor solape si hay varias). Igual
+    /// que `columnID(overlapping:)`, pero para soltar piezas dentro de una carpeta.
+    func boardFolderID(overlapping rect: CGRect, excluding: Set<UUID> = []) -> UUID? {
+        var best: (id: UUID, area: Double)?
+        for item in activeBoard?.items ?? [] where item.kind == .board && !excluding.contains(item.id) {
+            let inter = item.frameRect.intersection(rect)
+            guard !inter.isNull, !inter.isEmpty else { continue }
+            let area = Double(inter.width * inter.height)
+            if area > (best?.area ?? 0) { best = (id: item.id, area: area) }
+        }
+        return best?.id
+    }
+
     /// Posición (0…nº de hijos) que ocuparía una pieza soltada en `point` dentro de la columna:
     /// compara el punto con el centro de cada hijo ya apilado. La comparte el indicador de la vista.
     func dropIndex(in columnID: UUID, at point: CGPoint) -> Int {
@@ -1510,7 +1671,7 @@ final class Store: ObservableObject {
         let items = (column.children ?? []).compactMap { id in activeBoard?.items.first { $0.id == id } }
         var y = column.y + ColumnMetrics.header + ColumnMetrics.padding
         for (i, child) in items.enumerated() {
-            let h = child.h * inner / max(child.w, 1)
+            let h = childRowHeight(child, inner: inner)
             if point.y < y + h / 2 { return i }
             y += h + ColumnMetrics.spacing
         }
@@ -1526,7 +1687,7 @@ final class Store: ObservableObject {
         let items = (column.children ?? []).compactMap { id in activeBoard?.items.first { $0.id == id } }
         var y = column.y + ColumnMetrics.header + ColumnMetrics.padding
         for child in items {
-            let h = child.h * inner / max(child.w, 1)
+            let h = childRowHeight(child, inner: inner)
             if point.y >= y && point.y < y + h { return child.id }
             y += h + ColumnMetrics.spacing
         }
@@ -1625,6 +1786,23 @@ final class Store: ObservableObject {
                 add(item)
                 offset.x += 28; offset.y += 28
             }
+        }
+    }
+
+    /// Diálogo nativo para elegir videos. Los copia al almacén, los inserta con su proporción y los sube.
+    func importVideosWithPanel(at point: CGPoint) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
+        panel.prompt = "Agregar"
+        guard panel.runModal() == .OK else { return }
+        var offset = CGPoint.zero
+        for url in panel.urls {
+            guard let name = Store.storeMedia(copyingFrom: url) else { continue }
+            add(videoItem(fileName: name, at: point + offset))
+            Task { await sync.uploadMedia(name, tracked: true) }
+            offset.x += 28; offset.y += 28
         }
     }
 }

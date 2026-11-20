@@ -158,7 +158,7 @@ struct ScriptEditor: View {
             }
             .padding(20)
         }
-        .overlay(alignment: .bottomLeading) { TrashButton().padding(20) }
+        .overlay(alignment: .bottomLeading) { HStack(spacing: 10) { InboxButton(); TrashButton() }.padding(20) }
         .overlay(alignment: .trailing) {
             ElementPalette(current: currentType, onPick: setType).padding(20)
         }

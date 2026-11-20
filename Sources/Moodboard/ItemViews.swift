@@ -1,4 +1,5 @@
 import SwiftUI
+import AVKit
 
 struct ItemView: View {
     let item: BoardItem
@@ -11,10 +12,14 @@ struct ItemView: View {
     var siblings: [BoardItem] = []
     /// Posición de inserción mientras se arrastra algo sobre esta columna (nil = no es el destino).
     var dropIndex: Int? = nil
+    /// true mientras se arrastra algo sobre esta carpeta (`.board`): la resalta como destino.
+    var folderTargeted: Bool = false
     /// Piezas contenidas que están seleccionadas (se resaltan dentro de la columna).
     var selectedChildren: Set<UUID> = []
     /// Clic sobre una pieza contenida: la activa para indicar que se puede sacar.
     var onChildTap: (UUID) -> Void = { _ in }
+    /// Doble clic sobre una carpeta contenida: abre su sub-tablero.
+    var onChildOpen: (UUID) -> Void = { _ in }
     /// Dibuja a resolución completa en vez de una miniatura dimensionada a pantalla. Lo usa el export
     /// a PDF, que necesita la foto entera para imprimir nítido; en el lienzo se queda en `false`.
     var fullResolution: Bool = false
@@ -31,6 +36,7 @@ struct ItemView: View {
         Group {
             switch item.kind {
             case .image: imageCard
+            case .video: videoCard
             case .note:  noteCard
             case .frame: frameCard
             case .text:  textBlock
@@ -55,6 +61,16 @@ struct ItemView: View {
             UploadBadge(media: item.media)
                 .scaleEffect(1 / scale, anchor: .topTrailing)
         }
+    }
+
+    // MARK: - Video
+
+    private var videoCard: some View {
+        VideoCard(media: item.media)
+            .overlay(alignment: .topTrailing) {
+                UploadBadge(media: item.media)
+                    .scaleEffect(1 / scale, anchor: .topTrailing)
+            }
     }
 
     /// Lado mayor (en px físicos) al que de verdad se dibuja la foto, para pedir una miniatura a esa
@@ -194,7 +210,16 @@ struct ItemView: View {
                 .fill(.regularMaterial)
                 .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
         )
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(.primary.opacity(0.08)))
+        .overlay(
+            // En reposo, un borde tenue; mientras se arrastra algo encima, se resalta en acento.
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(folderTargeted ? Color.accentColor : .primary.opacity(0.08),
+                              lineWidth: folderTargeted ? 2.5 : 1)
+                .background(folderTargeted
+                            ? RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08))
+                            : nil)
+        )
+        .animation(.easeInOut(duration: 0.15), value: folderTargeted)
     }
 
     // MARK: - Columna: contenedor organizador
@@ -227,7 +252,8 @@ struct ItemView: View {
                                         siblings: siblings,
                                         isSelected: selectedChildren.contains(child.id),
                                         fullResolution: fullResolution,
-                                        onTap: { onChildTap(child.id) })
+                                        onTap: { onChildTap(child.id) },
+                                        onOpen: { onChildOpen(child.id) })
                             // Al entrar/salir del contenedor la pieza se amplía/reduce con un fundido
                             // en lugar de aparecer o desaparecer de golpe.
                             .transition(.scale(scale: 0.6).combined(with: .opacity))
@@ -361,6 +387,54 @@ private struct UploadBadge: View {
     }
 }
 
+/// Reproductor de video embebido en el lienzo. Carga el archivo local del almacén; si aún no está
+/// (sincronización en curso) muestra un marcador y lo baja del servidor, reconstruyendo el reproductor al
+/// llegar. AVKit aporta los controles de transporte.
+private struct VideoCard: View {
+    let media: String?
+    @ObservedObject private var sync = SyncService.shared
+    @State private var player: AVPlayer?
+    @State private var requested = false
+
+    private var fileURL: URL? {
+        guard let media else { return nil }
+        let url = Store.mediaDir.appendingPathComponent(media)
+        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    }
+
+    var body: some View {
+        ZStack {
+            if let player {
+                VideoPlayer(player: player)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            } else {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(.black.opacity(0.85))
+                    .overlay {
+                        if media != nil && SyncConfig.isConfigured {
+                            ProgressView().controlSize(.small).tint(.white)
+                        } else {
+                            Image(systemName: "film").font(.largeTitle).foregroundStyle(.white.opacity(0.6))
+                        }
+                    }
+            }
+        }
+        .onAppear(perform: load)
+        .onChange(of: sync.mediaTick) { _, _ in load() }   // el archivo llegó del servidor: monta el reproductor
+        .onDisappear { player?.pause() }
+    }
+
+    private func load() {
+        guard player == nil else { return }
+        if let url = fileURL {
+            player = AVPlayer(url: url)
+        } else if let media, SyncConfig.isConfigured, !requested {
+            requested = true
+            Task { await SyncService.shared.downloadMedia(media) }
+        }
+    }
+}
+
 /// Muestra la zona recortada de una imagen cubriendo el tamaño dado (como aspectFill, pero del recorte).
 struct CroppedImage: View {
     let image: NSImage
@@ -394,21 +468,79 @@ private struct ColumnChildView: View {
     let isSelected: Bool
     var fullResolution: Bool = false
     let onTap: () -> Void
+    /// Doble clic: replica el del lienzo según el tipo (tablero → entrar, foto → lightbox…).
+    var onOpen: () -> Void = {}
+
+    /// El mouse está encima: resalta la pieza para indicar que se interactúa con ella (no con la columna).
+    @State private var hovering = false
 
     var body: some View {
-        let f = width / max(child.w, 1)
-        ItemView(item: child, scale: scale * f, isSelected: isSelected, isEditing: false,
-                 onTextChange: { _ in }, onEndEditing: {}, siblings: siblings,
-                 fullResolution: fullResolution)
-            .frame(width: child.w, height: child.h)
-            .scaleEffect(f, anchor: .topLeading)
-            .frame(width: width, height: child.h * f, alignment: .topLeading)
-            .clipped()
-            .allowsHitTesting(false)
+        content
             .contentShape(Rectangle())
+            .onTapGesture(count: 2) { onOpen() }
             .onTapGesture { onTap() }
-            // El arrastre para sacar la pieza del contenedor lo conduce el gesto de la columna
-            // (ver `itemDrag` en BoardCanvas): aquí no se añade, porque esta vista desaparece en
-            // cuanto la pieza abandona la columna y cortaría el arrastre a mitad.
+            .onHover { hovering = $0 }
+            // Aro de realce al pasar el mouse (si no está ya seleccionada): avisa de que es la pieza activa.
+            .overlay {
+                if hovering && !isSelected {
+                    RoundedRectangle(cornerRadius: child.kind == .board ? 6 : 2)
+                        .stroke(Color.accentColor.opacity(0.7), lineWidth: 2)
+                        .allowsHitTesting(false)
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: hovering)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        // Las carpetas se dibujan como una fila compacta (icono + nombre), no como la tarjeta cuadrada.
+        if child.kind == .board {
+            CompactBoardRow(child: child, width: width, isSelected: isSelected)
+        } else {
+            let f = width / max(child.w, 1)
+            ItemView(item: child, scale: scale * f, isSelected: isSelected, isEditing: false,
+                     onTextChange: { _ in }, onEndEditing: {}, siblings: siblings,
+                     fullResolution: fullResolution)
+                .frame(width: child.w, height: child.h)
+                .scaleEffect(f, anchor: .topLeading)
+                .frame(width: width, height: child.h * f, alignment: .topLeading)
+                .clipped()
+                .allowsHitTesting(false)
+                // El arrastre para sacar la pieza del contenedor lo conduce el gesto de la columna
+                // (ver `itemDrag` en BoardCanvas): aquí no se añade, porque esta vista desaparece en
+                // cuanto la pieza abandona la columna y cortaría el arrastre a mitad.
+        }
+    }
+}
+
+/// Fila compacta de una carpeta dentro de una columna: el icono de carpeta y, al lado, su nombre.
+/// Ocupa poco alto (`ColumnMetrics.boardRow`) en vez de la tarjeta cuadrada del lienzo.
+private struct CompactBoardRow: View {
+    let child: BoardItem
+    let width: Double
+    let isSelected: Bool
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "folder.fill")
+                .font(.system(size: 18))
+                .foregroundStyle(Color.accentColor)
+            Text(child.text.isEmpty ? "Tablero" : child.text)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .frame(width: width, height: Store.ColumnMetrics.boardRow, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(isSelected ? Color.accentColor : .primary.opacity(0.1),
+                        lineWidth: isSelected ? 2 : 1)
+        )
     }
 }

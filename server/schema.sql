@@ -27,3 +27,17 @@ CREATE TABLE IF NOT EXISTS auth (
   pw_salt    TEXT NOT NULL,
   iterations INTEGER NOT NULL
 );
+
+-- Bandeja de entrada: imágenes capturadas desde fuera de la app (p. ej. la extensión de
+-- Chrome en Instagram). Cola simple, sin control de revisión: la extensión sólo añade y
+-- la app consume. Al cargar una pieza en un tablero, la app la convierte en parte de la
+-- biblioteca y borra esta fila; el archivo ya está subido a R2 con su nombre `media`.
+CREATE TABLE IF NOT EXISTS inbox (
+  id         TEXT PRIMARY KEY,
+  media      TEXT NOT NULL,
+  source_url TEXT,
+  kind       TEXT NOT NULL DEFAULT 'image',
+  w          INTEGER,
+  h          INTEGER,
+  created_at TEXT NOT NULL
+);

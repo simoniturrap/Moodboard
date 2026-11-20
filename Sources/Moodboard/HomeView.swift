@@ -40,7 +40,7 @@ struct HomeView: View {
                 .onAppear { windowWidth = geo.size.width }
                 .onChange(of: geo.size.width) { _, w in windowWidth = w }
         })
-        .overlay(alignment: .bottomLeading) { TrashButton().padding(20) }
+        .overlay(alignment: .bottomLeading) { HStack(spacing: 10) { InboxButton(); TrashButton() }.padding(20) }
         // Las pestañas siguen a mano en el inicio: la casa activa, y las abiertas para volver.
         .toolbar { TabsToolbarItem(width: max(160, windowWidth - 120)) }
     }

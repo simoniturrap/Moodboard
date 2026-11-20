@@ -24,6 +24,12 @@
  *   GET    /share/:boardId     -> { token } | 404
  *   DELETE /share/:boardId     -> borra el enlace (idempotente)
  *
+ * Bandeja de entrada (autenticado): captura externa (extensión de Chrome en Instagram, etc.).
+ *   GET    /inbox              -> { items: [{ id, media, sourceUrl, kind, w, h, createdAt }] }
+ *   POST   /inbox              <- { media, sourceUrl?, kind?, w?, h? } -> { id }
+ *   DELETE /inbox/:id          -> borra la fila (idempotente). Con ?media=delete borra también
+ *                                 el objeto de R2 (descartar sin importar).
+ *
  * Visor público (SIN token, cualquiera con el link):
  *   GET    /s/:token           -> página HTML del visor
  *   GET    /s/:token/data      -> { name, items } del tablero, en vivo desde `library`
@@ -153,7 +159,7 @@ export default {
           return getSharedData(env, token);
         }
         if ((method === "GET" || method === "HEAD") && segments.length === 4 && segments[2] === "media") {
-          return getSharedMedia(env, token, segments[3], method);
+          return getSharedMedia(env, token, segments[3], method, request);
         }
         return text("Not found", 404);
       }
@@ -206,6 +212,17 @@ export default {
         if (segments.length === 2) {
           if (method === "GET") return getShare(env, segments[1]);
           if (method === "DELETE") return deleteShare(env, segments[1]);
+        }
+      }
+
+      // ---- /inbox , /inbox/:id -----------------------------------------
+      if (segments[0] === "inbox") {
+        if (segments.length === 1) {
+          if (method === "GET") return listInbox(env);
+          if (method === "POST") return addInbox(request, env);
+        }
+        if (segments.length === 2 && method === "DELETE") {
+          return deleteInbox(env, segments[1], url);
         }
       }
 
@@ -349,6 +366,63 @@ async function deleteShare(env: Env, boardId: string): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
+// bandeja de entrada (autenticado)
+// ---------------------------------------------------------------------------
+
+type InboxRow = {
+  id: string; media: string; source_url: string | null;
+  kind: string; w: number | null; h: number | null; created_at: string;
+};
+
+/** Lista lo que espera en la bandeja, de lo más reciente a lo más antiguo. */
+async function listInbox(env: Env): Promise<Response> {
+  const { results } = await env.DB.prepare(
+    "SELECT id, media, source_url, kind, w, h, created_at FROM inbox ORDER BY created_at DESC",
+  ).all<InboxRow>();
+  const items = (results ?? []).map((r) => ({
+    id: r.id,
+    media: r.media,
+    sourceUrl: r.source_url ?? undefined,
+    kind: r.kind,
+    w: r.w ?? undefined,
+    h: r.h ?? undefined,
+    createdAt: r.created_at,
+  }));
+  return json({ items });
+}
+
+/** Añade una captura a la bandeja. El archivo ya debe estar subido a R2 (`PUT /media/:name`). */
+async function addInbox(request: Request, env: Env): Promise<Response> {
+  const body = (await request.json()) as {
+    media?: string; sourceUrl?: string; kind?: string; w?: number; h?: number;
+  };
+  const media = body.media ? safeMediaName(body.media) : null;
+  if (!media) return text("Missing or bad media", 400);
+  const id = crypto.randomUUID().replace(/-/g, "");
+  const kind = body.kind === "video" ? "video" : "image";
+  await env.DB.prepare(
+    "INSERT INTO inbox (id, media, source_url, kind, w, h, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+  )
+    .bind(id, media, body.sourceUrl ?? null, kind, body.w ?? null, body.h ?? null, new Date().toISOString())
+    .run();
+  return json({ id });
+}
+
+/** Consume una fila de la bandeja (idempotente). Con `?media=delete`, borra también el objeto de R2:
+ *  lo usa la app al *descartar* una captura (si se importa a un tablero, el archivo se conserva porque
+ *  la biblioteca pasa a referenciarlo). */
+async function deleteInbox(env: Env, id: string, url: URL): Promise<Response> {
+  if (url.searchParams.get("media") === "delete") {
+    const row = await env.DB.prepare("SELECT media FROM inbox WHERE id = ?")
+      .bind(id)
+      .first<{ media: string }>();
+    if (row?.media) await env.MEDIA.delete(row.media);
+  }
+  await env.DB.prepare("DELETE FROM inbox WHERE id = ?").bind(id).run();
+  return json({ ok: true });
+}
+
+// ---------------------------------------------------------------------------
 // visor público (sin token)
 // ---------------------------------------------------------------------------
 
@@ -371,7 +445,7 @@ async function resolveSharedBoard(env: Env, token: string): Promise<SharedBoard 
 }
 
 /** Solo las piezas que el visor sabe dibujar (se omiten las carpetas `board`). */
-const VIEWABLE_KINDS = new Set(["image", "note", "text", "frame"]);
+const VIEWABLE_KINDS = new Set(["image", "video", "note", "text", "frame"]);
 
 async function getSharedData(env: Env, token: string): Promise<Response> {
   const board = await resolveSharedBoard(env, token);
@@ -391,14 +465,36 @@ function imageMime(name: string): string {
   return table[ext] ?? "application/octet-stream";
 }
 
-async function getSharedMedia(env: Env, token: string, rawName: string, method: string): Promise<Response> {
+/** Extensiones de video que el visor reproduce. */
+const VIDEO_EXT = new Set(["mp4", "m4v", "mov", "webm", "ogv"]);
+
+function isVideoName(name: string): boolean {
+  return VIDEO_EXT.has(name.split(".").pop()?.toLowerCase() ?? "");
+}
+
+/** Tipo MIME de video según la extensión. */
+function videoMime(name: string): string {
+  const ext = name.split(".").pop()?.toLowerCase() ?? "";
+  const table: Record<string, string> = {
+    mp4: "video/mp4", m4v: "video/mp4", mov: "video/quicktime",
+    webm: "video/webm", ogv: "video/ogg",
+  };
+  return table[ext] ?? "application/octet-stream";
+}
+
+async function getSharedMedia(
+  env: Env, token: string, rawName: string, method: string, request: Request,
+): Promise<Response> {
   const name = safeMediaName(rawName);
   if (!name) return text("Bad media name", 400);
   const board = await resolveSharedBoard(env, token);
   if (!board) return text("Not found", 404);
-  // Solo imágenes que el propio tablero usa: así el link no deja enumerar R2.
+  // Solo medios que el propio tablero usa: así el link no deja enumerar R2.
   const referenced = new Set((board.items ?? []).map((i) => i.media).filter(Boolean));
   if (!referenced.has(name)) return text("Not found", 404);
+
+  // Video: servir con su tipo y soporte de Range (seek y reproducción progresiva).
+  if (isVideoName(name)) return getSharedVideo(env, name, method, request);
 
   const obj = await env.MEDIA.get(name);
   if (!obj) return text("Not found", 404);
@@ -412,6 +508,48 @@ async function getSharedMedia(env: Env, token: string, rawName: string, method: 
   return new Response(method === "HEAD" ? null : obj.body, { headers });
 }
 
+/** Sirve un video con `Accept-Ranges` y respuesta parcial (206) si el navegador pide un rango. */
+async function getSharedVideo(env: Env, name: string, method: string, request: Request): Promise<Response> {
+  const mime = videoMime(name);
+  const rangeHeader = request.headers.get("range");
+
+  // HEAD o sin Range: objeto completo (200).
+  if (method === "HEAD" || !rangeHeader) {
+    const obj = await env.MEDIA.get(name);
+    if (!obj) return text("Not found", 404);
+    const headers = new Headers();
+    headers.set("content-type", mime);
+    headers.set("etag", obj.httpEtag);
+    headers.set("accept-ranges", "bytes");
+    headers.set("content-length", String(obj.size));
+    headers.set("cache-control", "public, max-age=3600");
+    return new Response(method === "HEAD" ? null : obj.body, { headers });
+  }
+
+  // Range: "bytes=inicio-fin" (fin opcional). Pedimos a R2 sólo ese tramo y respondemos 206.
+  const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+  const head = await env.MEDIA.head(name);
+  if (!head) return text("Not found", 404);
+  const total = head.size;
+  const start = match && match[1] ? parseInt(match[1], 10) : 0;
+  const end = match && match[2] ? parseInt(match[2], 10) : total - 1;
+  if (isNaN(start) || isNaN(end) || start > end || start >= total) {
+    return new Response("Range Not Satisfiable", {
+      status: 416, headers: { "content-range": `bytes */${total}` },
+    });
+  }
+  const obj = await env.MEDIA.get(name, { range: { offset: start, length: end - start + 1 } });
+  if (!obj) return text("Not found", 404);
+  const headers = new Headers();
+  headers.set("content-type", mime);
+  headers.set("etag", obj.httpEtag);
+  headers.set("accept-ranges", "bytes");
+  headers.set("content-range", `bytes ${start}-${end}/${total}`);
+  headers.set("content-length", String(end - start + 1));
+  headers.set("cache-control", "public, max-age=3600");
+  return new Response(obj.body, { status: 206, headers });
+}
+
 /** Imagen de portada para la vista previa del enlace: la elegida por el usuario o la primera foto.
  *  Si no hay portada elegida, prefiere un formato que las redes previsualizan bien (jpg/png/gif). */
 function coverMedia(board: SharedBoard): string | null {
@@ -420,7 +558,8 @@ function coverMedia(board: SharedBoard): string | null {
   if (chosen && items.some((i) => i.media === chosen)) return chosen;
   const medias = items.map((i) => i.media).filter(Boolean) as string[];
   const safe = /\.(jpe?g|png|gif)$/i;
-  return medias.find((m) => safe.test(m)) ?? medias[0] ?? null;
+  // La portada OG debe ser una imagen (las redes no previsualizan video); nunca un archivo de video.
+  return medias.find((m) => safe.test(m)) ?? medias.find((m) => !isVideoName(m)) ?? null;
 }
 
 function escapeHtml(s: string): string {
@@ -545,6 +684,9 @@ __FONTS__
   .item { position: absolute; overflow: hidden; pointer-events: none; }
   .item img { display: block; position: absolute; top: 0; left: 0;
     -webkit-user-drag: none; user-drag: none; }
+  /* El video sí recibe eventos (sus controles deben responder), al revés que el resto del lienzo. */
+  .item video { display: block; width: 100%; height: 100%; object-fit: cover;
+    border-radius: 4px; background: #000; pointer-events: auto; }
   .note { border-radius: 8px; padding: 12px; color: rgba(0,0,0,0.85);
     white-space: pre-wrap; word-break: break-word; box-shadow: 0 4px 8px rgba(0,0,0,0.3); }
   .text { padding: 4px 5px; white-space: pre-wrap; word-break: break-word; }
@@ -648,6 +790,15 @@ __FONTS__
 
       if (it.kind === 'image') {
         if (it.media) el.appendChild(imageEl(it, it.w, it.h));
+      } else if (it.kind === 'video') {
+        if (it.media) {
+          var vid = document.createElement('video');
+          vid.src = MEDIA + it.media;
+          vid.controls = true;
+          vid.playsInline = true;
+          vid.preload = 'metadata';
+          el.appendChild(vid);
+        }
       } else if (it.kind === 'note') {
         el.classList.add('note');
         el.style.background = hex(it.colorHex, 'FFE9A8');

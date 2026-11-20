@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Moodboard — Capturar a la bandeja",
+  "version": "1.0.0",
+  "description": "Guarda imágenes de la web en la bandeja de entrada de Moodboard con un clic.",
+  "permissions": ["storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Moodboard"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*", "https://instagram.com/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}

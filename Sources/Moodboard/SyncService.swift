@@ -459,6 +459,27 @@ final class SyncService: ObservableObject {
         _ = try? await URLSession.shared.data(for: req)
     }
 
+    // MARK: - Bandeja de entrada
+
+    private struct InboxResponse: Decodable { let items: [InboxItem] }
+
+    /// Baja la lista de capturas que esperan en la bandeja del servidor. nil si falla o no hay sesión.
+    func fetchInbox() async -> [InboxItem]? {
+        guard let req = makeRequest("/inbox"),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let r = try? JSONDecoder().decode(InboxResponse.self, from: data) else { return nil }
+        return r.items
+    }
+
+    /// Consume una captura de la bandeja. Con `discardMedia` borra también su imagen de R2 (descartar
+    /// sin importar); al importarla a un tablero se conserva, porque la biblioteca pasa a usarla.
+    func deleteInboxItem(_ id: String, discardMedia: Bool) async {
+        let path = "/inbox/\(id)" + (discardMedia ? "?media=delete" : "")
+        guard let req = makeRequest(path, method: "DELETE") else { return }
+        _ = try? await URLSession.shared.data(for: req)
+    }
+
     // MARK: - Prueba de conexión
 
     @discardableResult
