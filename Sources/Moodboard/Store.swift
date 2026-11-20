@@ -27,6 +27,9 @@ final class Store: ObservableObject {
     @Published var inboxItems: [InboxItem] = []
     /// Cascada de las piezas que se van cargando desde la bandeja, para que no caigan unas sobre otras.
     private var inboxPlaceCount = 0
+    /// Capturas que se están cargando ahora mismo (descarga en curso): se ocultan de la bandeja para
+    /// que un refresco no las muestre de nuevo y se carguen dos veces.
+    private var importingInboxIDs: Set<String> = []
     /// Modal de ajustes de sincronización con el servidor.
     @Published var isShowingSync = false
     /// Hoja de "Compartir tablero" con el enlace público.
@@ -1333,23 +1336,59 @@ final class Store: ObservableObject {
     /// colocación para que la próxima tanda que se cargue empiece centrada.
     func refreshInbox() async {
         guard SyncConfig.isConfigured else { return }
-        if let items = await sync.fetchInbox() { inboxItems = items }
+        if let items = await sync.fetchInbox() {
+            // Oculta las que se están cargando en este momento: evita que reaparezcan y se dupliquen.
+            inboxItems = items.filter { !importingInboxIDs.contains($0.id) }
+        }
         inboxPlaceCount = 0
     }
 
+    /// Id de pieza **determinista** a partir del id de la captura: cargar la misma captura en dos
+    /// equipos produce el mismo id, así la fusión la colapsa en una sola pieza en vez de duplicarla.
+    /// El id del servidor es un UUID sin guiones (32 hex); se reinsertan para reconstruir el UUID.
+    static func itemID(forInbox inboxID: String) -> UUID {
+        let hex = inboxID.replacingOccurrences(of: "-", with: "")
+        if hex.count == 32 {
+            let s = Array(hex)
+            let dashed = "\(String(s[0..<8]))-\(String(s[8..<12]))-\(String(s[12..<16]))-\(String(s[16..<20]))-\(String(s[20..<32]))"
+            if let u = UUID(uuidString: dashed) { return u }
+        }
+        return UUID()
+    }
+
     /// Carga una captura de la bandeja en el tablero activo: baja su imagen, la coloca como una pieza
-    /// normal y la consume del servidor (conservando el archivo, que la biblioteca pasa a usar).
+    /// normal (con id determinista) y la consume del servidor (conservando el archivo, que la biblioteca
+    /// pasa a usar). Si la pieza ya está en el tablero (la cargó el otro equipo y llegó por sync), no la
+    /// vuelve a añadir: solo limpia la bandeja.
     func importFromInbox(_ item: InboxItem) {
-        guard activeBoard != nil else { return }
+        guard let board = activeBoard else { return }
+        let itemID = Self.itemID(forInbox: item.id)
+        inboxItems.removeAll { $0.id == item.id }   // respuesta inmediata en la bandeja
+        if board.items.contains(where: { $0.id == itemID }) {
+            Task { await sync.deleteInboxItem(item.id, discardMedia: false) }
+            return
+        }
         let base = visibleWorldRect.isEmpty ? .zero : CGPoint(x: visibleWorldRect.midX, y: visibleWorldRect.midY)
         let step = Double(inboxPlaceCount) * 26
         inboxPlaceCount += 1
         let point = base + CGPoint(x: step, y: step)
-        inboxItems.removeAll { $0.id == item.id }   // respuesta inmediata en la bandeja
+        importingInboxIDs.insert(item.id)
         Task {
-            guard await sync.downloadMedia(item.media) else { return }
-            add(item.isVideo ? videoItem(fileName: item.media, at: point)
-                             : imageItem(fileName: item.media, at: point, kind: .image))
+            defer { importingInboxIDs.remove(item.id) }
+            guard await sync.downloadMedia(item.media) else {
+                inboxItems.insert(item, at: 0)   // falló la descarga: devuélvela a la bandeja
+                return
+            }
+            // Si mientras bajaba la imagen la pieza ya llegó por sync, no la dupliques.
+            guard activeBoard?.id == board.id,
+                  activeBoard?.items.contains(where: { $0.id == itemID }) == false else {
+                await sync.deleteInboxItem(item.id, discardMedia: false)
+                return
+            }
+            var piece = item.isVideo ? videoItem(fileName: item.media, at: point)
+                                     : imageItem(fileName: item.media, at: point, kind: .image)
+            piece.id = itemID
+            add(piece)
             await sync.deleteInboxItem(item.id, discardMedia: false)
         }
     }

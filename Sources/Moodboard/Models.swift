@@ -414,7 +414,8 @@ extension Library {
         // --- Piezas: unión por id ---
         var byID: [UUID: BoardItem] = [:]
         var order: [UUID] = []
-        for item in mine.items + theirs.items where byID[item.id] == nil { order.append(item.id) }
+        var seenOrder: Set<UUID> = []
+        for item in mine.items + theirs.items where seenOrder.insert(item.id).inserted { order.append(item.id) }
         for item in mine.items { byID[item.id] = item }
         for item in theirs.items {
             if let cur = byID[item.id] {
