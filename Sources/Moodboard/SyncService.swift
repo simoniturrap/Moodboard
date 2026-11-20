@@ -275,6 +275,19 @@ final class SyncService: ObservableObject {
         pendingPush = Self.decode(remote.json).map { local.merged(with: $0) } ?? local
     }
 
+    private struct RevisionResponse: Decodable { let revision: Int }
+
+    /// Sondeo barato: sólo el número de revisión del servidor, sin bajar el documento ni tocar el
+    /// estado visible. El cliente lo compara con la revisión que conoce para decidir si vale la pena
+    /// bajar el documento entero. nil si falla o no hay sesión.
+    func pollRevision() async -> Int? {
+        guard let req = makeRequest("/revision"),
+              let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let r = try? JSONDecoder().decode(RevisionResponse.self, from: data) else { return nil }
+        return r.revision
+    }
+
     /// Baja el documento del servidor. Devuelve (biblioteca, revisión) o nil si no hay nada / error.
     func pull() async -> (library: Library, revision: Int)? {
         guard let req = makeRequest("/library") else { return nil }

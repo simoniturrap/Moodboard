@@ -9,6 +9,7 @@
  *   POST   /auth/setup        <- { email, password } -> { ok }       (requiere token: fija/cambia la cuenta)
  *
  *   GET    /library            -> { revision, json }  | 404 si aún no hay nada
+ *   GET    /revision           -> { revision }  (sondeo barato: 0 si aún no hay nada)
  *   PUT    /library            <- { baseRevision, json }
  *                                 200 { revision } si baseRevision coincide (o primer push)
  *                                 409 { revision, json } si hay una versión más nueva
@@ -188,6 +189,11 @@ export default {
         if (method === "PUT") return putLibrary(request, env);
       }
 
+      // ---- /revision : sólo el número de revisión (sondeo barato) ------
+      if (segments.length === 1 && segments[0] === "revision" && method === "GET") {
+        return getRevision(env);
+      }
+
       // ---- /usage ------------------------------------------------------
       if (segments.length === 1 && segments[0] === "usage" && method === "GET") {
         return getUsage(env);
@@ -243,6 +249,15 @@ async function getLibrary(env: Env): Promise<Response> {
     .first<{ revision: number; json: string }>();
   if (!row) return text("No library yet", 404);
   return json({ revision: row.revision, json: row.json });
+}
+
+/** Sólo la revisión actual (0 si aún no hay documento). Sondeo barato para la sincronización en vivo:
+ *  el cliente la compara con la que conoce y sólo baja el documento entero si cambió. */
+async function getRevision(env: Env): Promise<Response> {
+  const row = await env.DB.prepare("SELECT revision FROM library WHERE id = ?")
+    .bind(LIBRARY_ID)
+    .first<{ revision: number }>();
+  return json({ revision: row?.revision ?? 0 });
 }
 
 async function putLibrary(request: Request, env: Env): Promise<Response> {

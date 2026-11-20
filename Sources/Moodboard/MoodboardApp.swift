@@ -1,8 +1,28 @@
 import SwiftUI
 import AppKit
 
+/// Delegado mínimo: sólo para retener el cierre de la app hasta que los últimos cambios lleguen al
+/// servidor. SwiftUI por sí solo no espera a las subidas async al terminar, y se perdían.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard SyncConfig.isConfigured, let store = Store.current else { return .terminateNow }
+        Task { @MainActor in
+            // Empuja lo pendiente, pero con un tope de 3 s para que un fallo de red no cuelgue el cierre.
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { await store.flushAndWait() }
+                group.addTask { try? await Task.sleep(for: .seconds(3)) }
+                await group.next()
+                group.cancelAll()
+            }
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+}
+
 @main
 struct MoodboardApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var store = Store()
     @StateObject private var updater = UpdaterController()
     @AppStorage(themePreferenceKey) private var theme = ThemePreference.system.rawValue

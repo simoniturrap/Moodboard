@@ -60,6 +60,14 @@ final class Store: ObservableObject {
     private let saveDebounce = 0.6
     private var saveTask: Task<Void, Never>?
 
+    /// Sondeo periódico del servidor para ver cambios de otro equipo sin tener que reactivar la ventana
+    /// (sincronización casi en vivo).
+    private let pollInterval = 15.0
+    private var pollTask: Task<Void, Never>?
+
+    /// Instancia viva del Store, para que el delegado de la app pueda vaciar lo pendiente al cerrar.
+    static weak var current: Store?
+
     // MARK: - Rutas en disco
 
     nonisolated static let root: URL = {
@@ -130,6 +138,8 @@ final class Store: ObservableObject {
         sync.onMediaArrived = { [weak self] in self?.objectWillChange.send() }
         Task { await bootstrapSync() }
         registerLifecycleObservers()
+        Store.current = self
+        startPolling()
         // Guarda ya el documento reparado (y lo encola para subir), para no rehacer la limpieza en
         // cada arranque y para sanear también la copia del servidor.
         if healedDuplicates { saveNow() }
@@ -157,6 +167,41 @@ final class Store: ObservableObject {
             forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.flush() }
         }
+        // Al despertar el equipo: vuelve a bajar lo que haya cambiado en el otro equipo mientras dormía.
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshFromServer()
+                await self?.refreshInbox()
+            }
+        }
+    }
+
+    // MARK: - Sondeo en vivo
+
+    /// Arranca el bucle de sondeo: cada `pollInterval` pregunta al servidor sólo la revisión y, si hay
+    /// algo nuevo, baja y fusiona. Así un equipo que quedó abierto ve los cambios del otro sin que
+    /// haya que reactivar la ventana.
+    private func startPolling() {
+        pollTask?.cancel()
+        pollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(self?.pollInterval ?? 15))
+                guard !Task.isCancelled else { return }
+                await self?.pollForChanges()
+            }
+        }
+    }
+
+    /// Comprobación barata: si el servidor tiene una revisión distinta de la conocida, baja y fusiona.
+    /// No interrumpe una edición de texto en curso ni se solapa con otra sincronización.
+    func pollForChanges() async {
+        guard SyncConfig.isConfigured, didBootstrap, !isSyncInFlight, editingItem == nil,
+              let remote = await sync.pollRevision() else { return }
+        if remote != SyncConfig.knownRevision {
+            await refreshFromServer()
+            await refreshInbox()
+        }
     }
 
     /// Fuerza que lo pendiente llegue al disco y al servidor ya mismo (sin el retraso habitual).
@@ -164,6 +209,15 @@ final class Store: ObservableObject {
         saveTask?.cancel()
         saveNow()                       // escribe a disco y agenda el push
         sync.pushImmediately(library)   // y lo empuja sin esperar
+    }
+
+    /// Como `flush`, pero **espera** a que el empujón al servidor termine. Lo usa el delegado de la app
+    /// al cerrar, para que los últimos cambios salgan de este equipo antes de que muera el proceso
+    /// (si no, la subida async se perdía al terminar). El tope de tiempo lo pone quien llama.
+    func flushAndWait() async {
+        saveTask?.cancel()
+        saveNow()
+        await sync.pushNow(library)
     }
 
     /// Baja la biblioteca del servidor y la fusiona con la local. Sólo reemplaza lo que esté en
