@@ -108,6 +108,8 @@ struct BoardSwitcher: View {
         query = ""
         withAnimation(spring) { store.isBoardMenuOpen = true }
         DispatchQueue.main.async { searchFocused = true }
+        // Al desplegar la lista, baja del servidor por si el otro equipo creó o borró tableros.
+        Task { await store.refreshFromServer() }
     }
 
     private func close() {

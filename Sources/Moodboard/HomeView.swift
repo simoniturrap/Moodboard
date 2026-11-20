@@ -41,6 +41,12 @@ struct HomeView: View {
                 .onChange(of: geo.size.width) { _, w in windowWidth = w }
         })
         .overlay(alignment: .bottomLeading) { HStack(spacing: 10) { InboxButton(); TrashButton() }.padding(20) }
+        // Cada vez que se muestra el inicio, baja del servidor la lista de proyectos para no ver una
+        // lista vieja respecto del otro equipo (se crean/borran tableros desde cualquiera de los dos).
+        .task {
+            await store.refreshFromServer()
+            await store.refreshInbox()
+        }
         // Las pestañas siguen a mano en el inicio: la casa activa, y las abiertas para volver.
         .toolbar { TabsToolbarItem(width: max(160, windowWidth - 120)) }
     }

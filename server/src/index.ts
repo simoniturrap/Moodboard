@@ -260,9 +260,50 @@ async function getRevision(env: Env): Promise<Response> {
   return json({ revision: row?.revision ?? 0 });
 }
 
+/** Colapsa ítems con el mismo id dentro de cada tablero, conservando por id la versión más reciente
+ *  (mayor `modifiedAt`; en empate, la primera). Blindaje del servidor: una versión vieja de la app
+ *  concatenaba las piezas sin deduplicar y las subía duplicadas en cada ronda (×2, ×4, …), inflando
+ *  el documento y repitiendo las fotos. Deduplicar al escribir impide que ningún cliente —por viejo
+ *  que sea— vuelva a corromper el documento. Devuelve el JSON saneado (o el original si no se tocó). */
+function dedupeLibraryJSON(jsonStr: string): string {
+  let lib: { boards?: Array<{ items?: Array<{ id?: string; modifiedAt?: number }> }> };
+  try {
+    lib = JSON.parse(jsonStr);
+  } catch {
+    return jsonStr; // si no parsea, se guarda tal cual (no es tarea del Worker validar el esquema)
+  }
+  if (!lib || !Array.isArray(lib.boards)) return jsonStr;
+  let changed = false;
+  for (const board of lib.boards) {
+    const items = board.items;
+    if (!Array.isArray(items)) continue;
+    const byId = new Map<string, { id?: string; modifiedAt?: number }>();
+    const order: string[] = [];
+    for (const item of items) {
+      const id = item?.id;
+      if (id == null) continue;
+      const prev = byId.get(id);
+      if (prev === undefined) {
+        byId.set(id, item);
+        order.push(id);
+      } else {
+        const a = typeof item.modifiedAt === "number" ? item.modifiedAt : -Infinity;
+        const p = typeof prev.modifiedAt === "number" ? prev.modifiedAt : -Infinity;
+        if (a > p) byId.set(id, item);
+      }
+    }
+    if (order.length !== items.length) {
+      board.items = order.map((id) => byId.get(id)!);
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(lib) : jsonStr;
+}
+
 async function putLibrary(request: Request, env: Env): Promise<Response> {
   const body = (await request.json()) as { baseRevision?: number; json?: string };
   if (typeof body.json !== "string") return text("Missing json", 400);
+  body.json = dedupeLibraryJSON(body.json);
 
   const current = await env.DB.prepare("SELECT revision FROM library WHERE id = ?")
     .bind(LIBRARY_ID)
