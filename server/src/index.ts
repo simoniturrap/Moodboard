@@ -260,13 +260,36 @@ async function getRevision(env: Env): Promise<Response> {
   return json({ revision: row?.revision ?? 0 });
 }
 
-/** Colapsa ítems con el mismo id dentro de cada tablero, conservando por id la versión más reciente
- *  (mayor `modifiedAt`; en empate, la primera). Blindaje del servidor: una versión vieja de la app
- *  concatenaba las piezas sin deduplicar y las subía duplicadas en cada ronda (×2, ×4, …), inflando
- *  el documento y repitiendo las fotos. Deduplicar al escribir impide que ningún cliente —por viejo
- *  que sea— vuelva a corromper el documento. Devuelve el JSON saneado (o el original si no se tocó). */
+type WithId = { id?: string; modifiedAt?: number };
+
+/** Colapsa un array de elementos con el mismo id, conservando por id el de mayor `modifiedAt` (en
+ *  empate, el primero), respetando el orden de primera aparición. Devuelve null si no había duplicados. */
+function dedupeById<T extends WithId>(arr: T[]): T[] | null {
+  const byId = new Map<string, T>();
+  const order: string[] = [];
+  for (const el of arr) {
+    const id = el?.id;
+    if (id == null) continue;
+    const prev = byId.get(id);
+    if (prev === undefined) {
+      byId.set(id, el);
+      order.push(id);
+    } else {
+      const a = typeof el.modifiedAt === "number" ? el.modifiedAt : -Infinity;
+      const p = typeof prev.modifiedAt === "number" ? prev.modifiedAt : -Infinity;
+      if (a > p) byId.set(id, el);
+    }
+  }
+  return order.length === arr.length ? null : order.map((id) => byId.get(id)!);
+}
+
+/** Colapsa piezas y notas con el mismo id dentro de cada tablero. Blindaje del servidor: una versión
+ *  vieja de la app concatenaba piezas (y notas) sin deduplicar y las subía duplicadas en cada ronda
+ *  (×2, ×4, …), inflando el documento, repitiendo las fotos y disparando el conteo de notas a decenas
+ *  de miles. Deduplicar al escribir impide que ningún cliente —por viejo que sea— vuelva a corromper
+ *  el documento. Devuelve el JSON saneado (o el original si no se tocó nada). */
 function dedupeLibraryJSON(jsonStr: string): string {
-  let lib: { boards?: Array<{ items?: Array<{ id?: string; modifiedAt?: number }> }> };
+  let lib: { boards?: Array<{ items?: WithId[]; notes?: WithId[] }> };
   try {
     lib = JSON.parse(jsonStr);
   } catch {
@@ -275,26 +298,13 @@ function dedupeLibraryJSON(jsonStr: string): string {
   if (!lib || !Array.isArray(lib.boards)) return jsonStr;
   let changed = false;
   for (const board of lib.boards) {
-    const items = board.items;
-    if (!Array.isArray(items)) continue;
-    const byId = new Map<string, { id?: string; modifiedAt?: number }>();
-    const order: string[] = [];
-    for (const item of items) {
-      const id = item?.id;
-      if (id == null) continue;
-      const prev = byId.get(id);
-      if (prev === undefined) {
-        byId.set(id, item);
-        order.push(id);
-      } else {
-        const a = typeof item.modifiedAt === "number" ? item.modifiedAt : -Infinity;
-        const p = typeof prev.modifiedAt === "number" ? prev.modifiedAt : -Infinity;
-        if (a > p) byId.set(id, item);
-      }
+    if (Array.isArray(board.items)) {
+      const deduped = dedupeById(board.items);
+      if (deduped) { board.items = deduped; changed = true; }
     }
-    if (order.length !== items.length) {
-      board.items = order.map((id) => byId.get(id)!);
-      changed = true;
+    if (Array.isArray(board.notes)) {
+      const deduped = dedupeById(board.notes);
+      if (deduped) { board.notes = deduped; changed = true; }
     }
   }
   return changed ? JSON.stringify(lib) : jsonStr;

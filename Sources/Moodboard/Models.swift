@@ -459,11 +459,11 @@ extension Library {
     /// Fecha de una pieza para comparar; nil (archivo antiguo) se trata como la más vieja posible.
     private static func date(_ value: Date?) -> Date { value ?? .distantPast }
 
-    /// Repara datos heredados: colapsa piezas con el mismo id dentro de cada tablero, conservando por
-    /// id la versión más reciente (y, en empate, la primera). Una versión vieja del sync concatenaba
-    /// las piezas sin deduplicar, duplicándolas en cada ronda (×2, ×4, … hasta miles): eso inflaba el
-    /// documento (lentitud) y dejaba ids repetidos que hacían abortar el pegar/clonar. Devuelve `true`
-    /// si eliminó algún duplicado.
+    /// Repara datos heredados: colapsa piezas **y notas** con el mismo id dentro de cada tablero,
+    /// conservando por id la versión más reciente (y, en empate, la primera). Una versión vieja del
+    /// sync concatenaba piezas (y notas) sin deduplicar, duplicándolas en cada ronda (×2, ×4, … hasta
+    /// miles): eso inflaba el documento (lentitud), dejaba ids repetidos que hacían abortar el
+    /// pegar/clonar, y disparaba el conteo de notas a decenas de miles. Devuelve `true` si eliminó algo.
     @discardableResult
     mutating func dedupeItems() -> Bool {
         var changed = false
@@ -482,6 +482,23 @@ extension Library {
             if order.count != items.count {
                 boards[i].items = order.compactMap { byID[$0] }
                 changed = true
+            }
+            // Notas (documentos de Notas): mismo colapso por id, conservando la más reciente.
+            if let notes = boards[i].notes {
+                var notesByID: [UUID: Note] = [:]
+                var notesOrder: [UUID] = []
+                for note in notes {
+                    if let cur = notesByID[note.id] {
+                        if note.modifiedAt > cur.modifiedAt { notesByID[note.id] = note }
+                    } else {
+                        notesByID[note.id] = note
+                        notesOrder.append(note.id)
+                    }
+                }
+                if notesOrder.count != notes.count {
+                    boards[i].notes = notesOrder.compactMap { notesByID[$0] }
+                    changed = true
+                }
             }
         }
         return changed
