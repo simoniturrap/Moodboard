@@ -424,9 +424,23 @@ extension Library {
         }
         // Aplica las lápidas: quita un tablero sólo si se borró *después* de su última modificación
         // (si se volvió a editar más tarde, es que renació y se conserva).
-        for (idStr, deletedAt) in boardTombs {
-            if let id = UUID(uuidString: idStr), let b = winner[id], b.lastModified <= deletedAt {
+        //
+        // Pero nunca quita un tablero que una carpeta viva todavía referencia con su `childBoardID`:
+        // borrar bien una carpeta elimina el tile y tombea el sub-tablero a la vez (removeBoardSubtrees),
+        // así que un tile vivo apuntando a un tablero tombeado sólo ocurre si una fusión desincronizó
+        // ambos lados. Protegerlo evita que el sub-tablero se pierda y deje una carpeta huérfana que no
+        // abre. Se hace en punto fijo porque quitar un tablero puede dejar sin referencia a otro.
+        var changed = true
+        while changed {
+            changed = false
+            let referenced = Set(winner.values.flatMap { board in
+                board.items.compactMap { $0.kind == .board ? $0.childBoardID : nil }
+            })
+            for (idStr, deletedAt) in boardTombs {
+                guard let id = UUID(uuidString: idStr), let b = winner[id],
+                      b.lastModified <= deletedAt, !referenced.contains(id) else { continue }
                 winner.removeValue(forKey: id)
+                changed = true
             }
         }
         // Orden estable: primero los tableros locales en su orden; luego los que sólo trae el otro.
