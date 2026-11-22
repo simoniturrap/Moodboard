@@ -11,8 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SHORT_VERSION="${SHORT_VERSION:-1.5.5}"
-BUILD_VERSION="${BUILD_VERSION:-12}"
+SHORT_VERSION="${SHORT_VERSION:-1.5.6}"
+BUILD_VERSION="${BUILD_VERSION:-13}"
 TAG="v${SHORT_VERSION}"
 REPO="simoniturrap/Moodboard"
 ZIP="Moodboard-${SHORT_VERSION}.zip"

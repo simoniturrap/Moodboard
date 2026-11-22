@@ -38,6 +38,8 @@ final class Store: ObservableObject {
     @Published var shareURL: URL?
     /// true mientras se sube el tablero al servidor y se pide el enlace.
     @Published var isPreparingShare = false
+    /// Aviso simple (p. ej. una carpeta que apunta a un tablero que ya no existe).
+    @Published var alertMessage: String?
     /// Desplegable de tableros recientes (botón flotante de arriba a la izquierda).
     @Published var isBoardMenuOpen = false
     /// Tablero recién abierto cuyo encuadre debe recolocar el lienzo (necesita el tamaño de la vista).
@@ -501,6 +503,114 @@ final class Store: ObservableObject {
         return board
     }
 
+    // MARK: - Vínculos entre documentos (guion ↔ tablero)
+
+    /// Vincula dos documentos en ambos sentidos (simétrico).
+    func linkBoards(_ a: UUID, _ b: UUID) {
+        guard a != b else { return }
+        checkpoint()
+        addLink(from: a, to: b)
+        addLink(from: b, to: a)
+        scheduleSave()
+    }
+
+    /// Crea un documento del tipo dado y lo vincula al actual, sin salir de donde estás.
+    func newLinkedDocument(kind: DocumentKind, linkedTo id: UUID) {
+        checkpoint()
+        let board = makeBoard(named: kind.untitled, kind: kind)
+        library.boards.append(board)
+        addLink(from: id, to: board.id)
+        addLink(from: board.id, to: id)
+        scheduleSave()
+    }
+
+    func unlinkBoards(_ a: UUID, _ b: UUID) {
+        checkpoint()
+        removeLink(from: a, to: b)
+        removeLink(from: b, to: a)
+        scheduleSave()
+    }
+
+    private func addLink(from: UUID, to: UUID) {
+        guard let i = library.boards.firstIndex(where: { $0.id == from }) else { return }
+        var ids = library.boards[i].linkedBoardIDs ?? []
+        if !ids.contains(to) { ids.append(to) }
+        library.boards[i].linkedBoardIDs = ids
+        library.boards[i].modifiedAt = Date()
+    }
+
+    private func removeLink(from: UUID, to: UUID) {
+        guard let i = library.boards.firstIndex(where: { $0.id == from }) else { return }
+        library.boards[i].linkedBoardIDs?.removeAll { $0 == to }
+        library.boards[i].modifiedAt = Date()
+    }
+
+    /// Documentos vinculados a `id` (unión de ambos sentidos), sólo los que existen, en el orden de la
+    /// biblioteca. Tolera que la fusión haya dejado el vínculo anotado en un solo lado.
+    func linkedBoards(of id: UUID) -> [Board] {
+        var ids = Set(library.boards.first { $0.id == id }?.linkedBoardIDs ?? [])
+        for b in library.boards where (b.linkedBoardIDs ?? []).contains(id) { ids.insert(b.id) }
+        ids.remove(id)
+        return library.boards.filter { ids.contains($0.id) }
+    }
+
+    // MARK: - Desglose por escena
+
+    func sceneDetail(_ sceneID: UUID) -> SceneDetail {
+        activeBoard?.sceneDetails?[sceneID.uuidString] ?? SceneDetail()
+    }
+
+    private func mutateSceneDetail(_ sceneID: UUID, coalescing: String? = nil, _ change: (inout SceneDetail) -> Void) {
+        checkpoint(coalescing: coalescing)
+        mutateBoard { board in
+            var map = board.sceneDetails ?? [:]
+            var detail = map[sceneID.uuidString] ?? SceneDetail()
+            change(&detail)
+            map[sceneID.uuidString] = detail
+            board.sceneDetails = map
+        }
+    }
+
+    func setSceneSynopsis(_ sceneID: UUID, _ text: String) {
+        mutateSceneDetail(sceneID, coalescing: "synopsis-\(sceneID.uuidString)") { $0.synopsis = text }
+    }
+
+    /// Añade un ítem a mano a un departamento de una escena.
+    func addBreakdownItem(_ sceneID: UUID, _ dept: Department, _ text: String) {
+        let name = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        mutateSceneDetail(sceneID) { detail in
+            var list = detail.added[dept.rawValue] ?? []
+            if !list.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) { list.append(name) }
+            detail.added[dept.rawValue] = list
+            detail.removed.removeAll { $0 == name.lowercased() }
+        }
+    }
+
+    /// Quita un ítem: si era manual lo borra; si era detectado, lo marca como quitado para que no vuelva.
+    func removeBreakdownItem(_ sceneID: UUID, _ dept: Department, _ text: String) {
+        mutateSceneDetail(sceneID) { detail in
+            let key = dept.rawValue
+            if let list = detail.added[key], list.contains(where: { $0.caseInsensitiveCompare(text) == .orderedSame }) {
+                let filtered = list.filter { $0.caseInsensitiveCompare(text) != .orderedSame }
+                detail.added[key] = filtered.isEmpty ? nil : filtered
+            } else {
+                let lower = text.lowercased()
+                if !detail.removed.contains(lower) { detail.removed.append(lower) }
+                detail.assigned[lower] = nil
+            }
+        }
+    }
+
+    /// Asigna un objeto detectado (sin clasificar o mal clasificado) a un departamento.
+    func assignBreakdownItem(_ sceneID: UUID, _ noun: String, to dept: Department) {
+        let lower = noun.lowercased()
+        mutateSceneDetail(sceneID) { detail in
+            detail.assigned[lower] = dept.rawValue
+            detail.removed.removeAll { $0 == lower }
+        }
+    }
+
     // MARK: - Guion
 
     var scriptLines: [ScriptLine] { activeBoard?.script ?? [] }
@@ -687,8 +797,15 @@ final class Store: ObservableObject {
     }
 
     /// Doble clic en una carpeta: abre su sub-tablero como pestaña.
+    /// Si el sub-tablero ya no existe (p. ej. se perdió en una fusión de sincronización), la carpeta
+    /// queda huérfana y antes no hacía nada al pulsarla; ahora se avisa en vez de fallar en silencio.
     func openBoardFolder(_ item: BoardItem) {
-        guard let child = item.childBoardID, library.boards.contains(where: { $0.id == child }) else { return }
+        guard let child = item.childBoardID else { return }
+        guard library.boards.contains(where: { $0.id == child }) else {
+            let name = item.text.isEmpty ? "Este tablero" : "«\(item.text)»"
+            alertMessage = "\(name) ya no existe. Puedes quitar esta carpeta vacía desde su menú contextual (clic derecho › Eliminar)."
+            return
+        }
         select(board: child)
     }
 

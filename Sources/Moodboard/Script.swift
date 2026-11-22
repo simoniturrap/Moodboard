@@ -154,7 +154,8 @@ struct ScriptEditor: View {
         .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 12) {
                 BoardSwitcher()
-                ScriptIndexPanel(index: index, onJump: { focus($0, caret: .max) })
+                LinkedBoardsBar(suggestKind: .board)
+                BreakdownPanel(onJump: { focus($0, caret: .max) })
             }
             .padding(20)
         }
@@ -458,70 +459,6 @@ private struct PageBreak: View {
         }
         .frame(width: ScriptLayout.page.width)
         .allowsHitTesting(false)
-    }
-}
-
-/// Aside izquierdo: personajes y lugares que van apareciendo; clic salta a su primera aparición.
-private struct ScriptIndexPanel: View {
-    let index: ScriptIndex
-    let onJump: (UUID) -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            section("Personajes", icon: "person.2", entries: index.characters,
-                    empty: "Aparecerán al escribir un Personaje")
-            Divider()
-            section("Lugares", icon: "mappin.and.ellipse", entries: index.places,
-                    empty: "Aparecerán al escribir una Escena")
-        }
-        .padding(10)
-        .frame(width: 180)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(.primary.opacity(0.1)))
-        .shadow(color: .black.opacity(0.15), radius: 10, y: 3)
-        .animation(.spring(duration: 0.3, bounce: 0.15), value: index.characters.map(\.name))
-        .animation(.spring(duration: 0.3, bounce: 0.15), value: index.places.map(\.name))
-    }
-
-    private func section(_ title: String, icon: String, entries: [ScriptIndex.Entry], empty: String) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Label(title, systemImage: icon)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.bottom, 4)
-            if entries.isEmpty {
-                Text(empty)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 1) {
-                        ForEach(entries) { entry in
-                            Button { onJump(entry.firstLine) } label: {
-                                HStack {
-                                    Text(entry.name)
-                                        .font(.system(size: 11))
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-                                    Spacer(minLength: 4)
-                                    Text("\(entry.count)")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 6)
-                                .frame(height: 22)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help("Ir a la primera aparición")
-                            .transition(.opacity.combined(with: .move(edge: .top)))
-                        }
-                    }
-                }
-                .frame(maxHeight: 180)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-        }
     }
 }
 

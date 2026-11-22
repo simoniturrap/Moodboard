@@ -120,6 +120,7 @@ struct BoardCanvas: View {
                 VStack(alignment: .leading, spacing: 10) {
                     BoardSwitcher()
                     breadcrumb
+                    LinkedBoardsBar(suggestKind: .script)
                 }
                 .padding(20)
             }

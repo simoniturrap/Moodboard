@@ -132,6 +132,12 @@ struct Board: Identifiable, Codable, Hashable {
     var parentID: UUID?
     /// Nombre de archivo de la imagen usada como portada del enlace compartido (nil = la primera foto).
     var cover: String?
+    /// Documentos vinculados a éste (guion↔tablero), por id. Vínculo por documento y simétrico: al
+    /// vincular se escribe en ambos lados; para mostrar se usa la unión, por si la fusión entre equipos
+    /// dejara el vínculo anotado en uno solo.
+    var linkedBoardIDs: [UUID]?
+    /// Desglose por escena (sólo guiones): ficha de cada escena, por id de la línea de encabezado.
+    var sceneDetails: [String: SceneDetail]?
     /// Lápidas: piezas (y notas) borradas de este tablero, con la fecha del borrado. Evitan que la
     /// fusión con otro equipo resucite algo que ya habías eliminado. Se podan por antigüedad (como la
     /// papelera). Clave = UUID de la pieza en texto.
@@ -243,6 +249,49 @@ struct ScriptLine: Identifiable, Codable, Hashable {
     var id = UUID()
     var type: ScriptElement
     var text: String = ""
+}
+
+/// Departamentos del desglose de producción. Cada uno se muestra como un grupo de tags/badges.
+enum Department: String, Codable, CaseIterable, Identifiable {
+    case cast, props, setDressing, wardrobe, lighting, sound
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .cast:       "Reparto"
+        case .props:      "Utilería"
+        case .setDressing:"Escenografía"
+        case .wardrobe:   "Vestuario"
+        case .lighting:   "Iluminación"
+        case .sound:      "Sonido"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .cast:        "person.2"
+        case .props:       "shippingbox"
+        case .setDressing: "sofa"
+        case .wardrobe:    "tshirt"
+        case .lighting:    "lightbulb"
+        case .sound:       "waveform"
+        }
+    }
+}
+
+/// Ficha de desglose de una escena: sinopsis más los ítems que el usuario añadió, quitó o reasignó a
+/// mano. Lo detectado automáticamente no se guarda (se recalcula del texto); sólo se persisten las
+/// decisiones del usuario, que mandan sobre la detección.
+struct SceneDetail: Codable, Hashable {
+    /// Ficha descriptiva de la escena.
+    var synopsis: String = ""
+    /// Ítems añadidos a mano, por departamento (clave = `Department.rawValue`).
+    var added: [String: [String]] = [:]
+    /// Objetos (en minúscula) que el usuario quitó: la detección no los vuelve a mostrar.
+    var removed: [String] = []
+    /// Objeto (en minúscula) → departamento al que el usuario lo asignó (manda sobre el diccionario).
+    var assigned: [String: String] = [:]
 }
 
 /// Personajes y lugares que aparecen en un guion, en orden de primera aparición.

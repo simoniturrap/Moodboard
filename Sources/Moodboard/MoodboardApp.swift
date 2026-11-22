@@ -171,5 +171,13 @@ struct RootView: View {
         .sheet(isPresented: $store.isShowingInbox) { InboxSheet() }
         .sheet(isPresented: $store.isShowingSync) { SyncSettingsSheet() }
         .sheet(isPresented: $store.isShowingShare) { ShareSheet() }
+        .alert("Aviso", isPresented: Binding(
+            get: { store.alertMessage != nil },
+            set: { if !$0 { store.alertMessage = nil } }
+        )) {
+            Button("Entendido", role: .cancel) { store.alertMessage = nil }
+        } message: {
+            Text(store.alertMessage ?? "")
+        }
     }
 }
