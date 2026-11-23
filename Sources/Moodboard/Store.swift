@@ -1544,7 +1544,7 @@ final class Store: ObservableObject {
                 await sync.deleteInboxItem(item.id, discardMedia: false)
                 return
             }
-            var piece = item.isVideo ? videoItem(fileName: item.media, at: point)
+            var piece = item.isVideo ? await videoItem(fileName: item.media, at: point)
                                      : imageItem(fileName: item.media, at: point, kind: .image)
             piece.id = itemID
             add(piece)
@@ -1627,8 +1627,8 @@ final class Store: ObservableObject {
 
     /// Inserta en el tablero una imagen ya guardada en el almacén (la copia a disco ya se hizo fuera
     /// del hilo principal) y lanza su subida al servidor. El tamaño se lee de la cabecera, sin decodificar.
-    private func placeImported(_ fileName: String, at point: CGPoint, kind: ItemKind) {
-        add(kind == .video ? videoItem(fileName: fileName, at: point) : imageItem(fileName: fileName, at: point, kind: kind))
+    private func placeImported(_ fileName: String, at point: CGPoint, kind: ItemKind) async {
+        add(kind == .video ? await videoItem(fileName: fileName, at: point) : imageItem(fileName: fileName, at: point, kind: kind))
         Task { await sync.uploadMedia(fileName, tracked: true) }
     }
 
@@ -1705,9 +1705,9 @@ final class Store: ObservableObject {
 
     /// Pieza de video: entra con el ancho fijo de las fotos y el alto según la proporción real del video
     /// (leída de su primera pista); 16:9 de reserva si no se puede medir.
-    private func videoItem(fileName: String, at point: CGPoint) -> BoardItem {
+    private func videoItem(fileName: String, at point: CGPoint) async -> BoardItem {
         let url = Store.mediaDir.appendingPathComponent(fileName)
-        let natural = Store.videoSize(of: url) ?? CGSize(width: 320, height: 180)
+        let natural = await Store.videoSize(of: url) ?? CGSize(width: 320, height: 180)
         let w = Grid.imageWidth
         let h = Grid.snap(w * natural.height / max(natural.width, 1))
         return BoardItem(kind: .video,
@@ -1719,10 +1719,11 @@ final class Store: ObservableObject {
 
     /// Dimensiones visibles del video (ancho×alto) leyendo la primera pista; respeta la transformación de
     /// orientación. nil si no se puede medir. Sólo lectura de metadatos: apto para fondo.
-    nonisolated static func videoSize(of url: URL) -> CGSize? {
+    nonisolated static func videoSize(of url: URL) async -> CGSize? {
         let asset = AVURLAsset(url: url)
-        guard let track = asset.tracks(withMediaType: .video).first else { return nil }
-        let size = track.naturalSize.applying(track.preferredTransform)
+        guard let track = try? await asset.loadTracks(withMediaType: .video).first,
+              let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform) else { return nil }
+        let size = natural.applying(transform)
         let s = CGSize(width: abs(size.width), height: abs(size.height))
         return (s.width > 0 && s.height > 0) ? s : nil
     }
@@ -2052,8 +2053,11 @@ final class Store: ObservableObject {
         var offset = CGPoint.zero
         for url in panel.urls {
             guard let name = Store.storeMedia(copyingFrom: url) else { continue }
-            add(videoItem(fileName: name, at: point + offset))
-            Task { await sync.uploadMedia(name, tracked: true) }
+            let at = point + offset
+            Task {
+                add(await videoItem(fileName: name, at: at))
+                await sync.uploadMedia(name, tracked: true)
+            }
             offset.x += 28; offset.y += 28
         }
     }
