@@ -177,14 +177,19 @@ struct BoardCanvas: View {
     private var visibleItems: [BoardItem] {
         // Las piezas que viven dentro de una columna las dibuja la columna, no el lienzo.
         let claimed = store.claimedItemIDs
-        let all = (board?.items ?? []).filter { !claimed.contains($0.id) }.sorted { $0.z < $1.z }
-        guard viewportSize.width > 0, viewportSize.height > 0 else { return all }
+        let all = board?.items ?? []
+        guard viewportSize.width > 0, viewportSize.height > 0 else {
+            return all.filter { !claimed.contains($0.id) }.sorted { $0.z < $1.z }
+        }
         let origin = toWorld(.zero)
         let visible = CGRect(x: origin.x, y: origin.y,
                              width: viewportSize.width / scale, height: viewportSize.height / scale)
         let margin = max(visible.width, visible.height) * 0.5
         let reach = visible.insetBy(dx: -margin, dy: -margin)
-        return all.filter { reach.intersects($0.frameRect) }
+        // Culling primero y orden por z después: ordenar sólo las piezas visibles (unas pocas) en vez
+        // del tablero entero evita un sort O(n·log n) de todo el contenido en cada frame de pan/zoom.
+        return all.filter { !claimed.contains($0.id) && reach.intersects($0.frameRect) }
+            .sorted { $0.z < $1.z }
     }
 
     private var content: some View {
@@ -197,10 +202,13 @@ struct BoardCanvas: View {
                          isEditing: store.editingItem == item.id,
                          onTextChange: { store.updateText(item.id, $0) },
                          onEndEditing: { store.editingItem = nil },
-                         siblings: board?.items ?? [],
+                         // Sólo las columnas necesitan la lista de piezas y la selección para dibujar su
+                         // contenido. Pasárselas al resto hacía que cualquier cambio en cualquier pieza
+                         // reconstruyera todas las vistas; limitarlo deja que SwiftUI salte las que no cambian.
+                         siblings: item.kind == .column ? (board?.items ?? []) : [],
                          dropIndex: dropTarget?.column == item.id ? dropTarget?.index : nil,
                          folderTargeted: folderTarget == item.id,
-                         selectedChildren: store.selection,
+                         selectedChildren: item.kind == .column ? store.selection : [],
                          onChildTap: { id in
                              store.focusArea = .canvas
                              store.editingItem = nil
@@ -341,10 +349,10 @@ struct BoardCanvas: View {
             .onChanged { value in
                 let base = panOrigin ?? camera
                 if panOrigin == nil { panOrigin = camera }
-                store.mutateBoard {
-                    $0.camera = draggedCamera(Camera(x: base.x + value.translation.width,
-                                                     y: base.y + value.translation.height,
-                                                     scale: base.scale))
+                store.moveCamera {
+                    $0 = draggedCamera(Camera(x: base.x + value.translation.width,
+                                              y: base.y + value.translation.height,
+                                              scale: base.scale))
                 }
             }
             .onEnded { _ in panOrigin = nil }
@@ -397,9 +405,7 @@ struct BoardCanvas: View {
                 } else {
                     dragAxis = nil
                 }
-                for (id, origin) in dragOrigins {
-                    store.update(id) { $0.origin = CGPoint(x: origin.x + dx, y: origin.y + dy) }
-                }
+                store.moveItems(origins: dragOrigins, by: CGSize(width: dx, height: dy))
                 // Resalta la columna que se solapa con lo arrastrado (basta tocar una esquina) y
                 // calcula dónde entraría según la altura del cursor/centro.
                 let draggedIDs = Set(dragOrigins.keys)
@@ -799,14 +805,14 @@ struct BoardCanvas: View {
             return
         }
         guard let b = contentBounds else {
-            store.mutateBoard { $0.camera.x += delta.dx; $0.camera.y += delta.dy }
+            store.moveCamera { $0.x += delta.dx; $0.y += delta.dy }
             return
         }
-        store.mutateBoard {
-            let rx = axisRange(viewport: viewportSize.width, scale: $0.camera.scale, contentLo: b.minX, contentHi: b.maxX)
-            let ry = axisRange(viewport: viewportSize.height, scale: $0.camera.scale, contentLo: b.minY, contentHi: b.maxY)
-            $0.camera.x = braked($0.camera.x, delta: delta.dx, lo: rx.lo, hi: rx.hi, soft: brakeZone)
-            $0.camera.y = braked($0.camera.y, delta: delta.dy, lo: ry.lo, hi: ry.hi, soft: brakeZone)
+        store.moveCamera {
+            let rx = axisRange(viewport: viewportSize.width, scale: $0.scale, contentLo: b.minX, contentHi: b.maxX)
+            let ry = axisRange(viewport: viewportSize.height, scale: $0.scale, contentLo: b.minY, contentHi: b.maxY)
+            $0.x = braked($0.x, delta: delta.dx, lo: rx.lo, hi: rx.hi, soft: brakeZone)
+            $0.y = braked($0.y, delta: delta.dy, lo: ry.lo, hi: ry.hi, soft: brakeZone)
         }
     }
 
@@ -826,7 +832,7 @@ struct BoardCanvas: View {
         let world = CGPoint(x: (pivot.x - camera.x) / old, y: (pivot.y - camera.y) / old)
         let raw = Camera(x: pivot.x - world.x * new, y: pivot.y - world.y * new, scale: new)
         withAnimation(animated ? zoomSpring : nil) {
-            store.mutateBoard { $0.camera = clampedCamera(raw) }
+            store.moveCamera { $0 = clampedCamera(raw) }
         }
     }
 
@@ -853,15 +859,15 @@ struct BoardCanvas: View {
               viewportSize.width > 0, viewportSize.height > 0 else { return }
         store.boardToFrame = nil
         guard let items = board?.items, !items.isEmpty else {
-            store.mutateBoard { $0.camera = Camera(x: openMargin, y: openMargin, scale: 1) }
+            store.moveCamera { $0 = Camera(x: openMargin, y: openMargin, scale: 1) }
             return
         }
         let bounds = items.dropFirst().reduce(items[0].frameRect) { $0.union($1.frameRect) }
         let sx = (viewportSize.width - openMargin * 2) / max(bounds.width, 1)
         let sy = (viewportSize.height - openMargin * 2) / max(bounds.height, 1)
         let s = min(1, max(0.15, min(sx, sy)))
-        store.mutateBoard {
-            $0.camera = Camera(x: openMargin - bounds.minX * s, y: openMargin - bounds.minY * s, scale: s)
+        store.moveCamera {
+            $0 = Camera(x: openMargin - bounds.minX * s, y: openMargin - bounds.minY * s, scale: s)
         }
     }
 
@@ -873,10 +879,10 @@ struct BoardCanvas: View {
         let sy = (viewportSize.height - pad * 2) / max(bounds.height, 1)
         let s = min(4, max(0.15, min(sx, sy)))
         withAnimation(zoomSpring) {
-            store.mutateBoard {
-                $0.camera.scale = s
-                $0.camera.x = viewportSize.width / 2 - bounds.midX * s
-                $0.camera.y = viewportSize.height / 2 - bounds.midY * s
+            store.moveCamera {
+                $0.scale = s
+                $0.x = viewportSize.width / 2 - bounds.midX * s
+                $0.y = viewportSize.height / 2 - bounds.midY * s
             }
         }
     }

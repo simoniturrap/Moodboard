@@ -277,10 +277,17 @@ final class Store: ObservableObject {
         isPreparingShare = true
         isShowingShare = true
         let id = board.id
-        let media = board.items.compactMap(\.media)
         Task {
-            await sync.pushNow(library)                 // garantiza que el servidor tiene la última versión
-            for name in media { await sync.uploadMedia(name) }
+            // Si el tablero ya estaba compartido, muestra el enlace al instante (copiable) sin esperar
+            // a subir la última versión: el enlace es en vivo y las imágenes se ponen al día detrás.
+            if let token = await sync.sharedToken(boardID: id) {
+                shareURL = SyncConfig.publicURL(token: token)
+                isPreparingShare = false
+            }
+            // Garantiza que el servidor tiene la última versión del documento y sus imágenes. `pushNow`
+            // ya sube las imágenes referenciadas en paralelo (vía `reconcile`), así que no hace falta
+            // recorrerlas aquí una a una (eso eran N viajes de red en serie antes de dar el enlace).
+            await sync.pushNow(library)
             if let token = await sync.share(boardID: id) {
                 shareURL = SyncConfig.publicURL(token: token)
             }
@@ -457,6 +464,41 @@ final class Store: ObservableObject {
         change(&library.boards[i])
         library.boards[i].modifiedAt = Date()
         scheduleSave()
+    }
+
+    /// Mueve o hace zoom de la cámara del tablero activo. Navegar no es una edición: no sella
+    /// `modifiedAt` ni empuja al servidor (eso sólo generaba tráfico y conflictos de fusión por
+    /// mirar el tablero), y guarda en disco con un retraso largo. La próxima edición real sube la
+    /// cámara junto a lo demás. Esto quita el guardado + push que antes se disparaban en cada frame
+    /// de pan/zoom, que era lo que más pesaba al navegar tableros con muchos elementos.
+    func moveCamera(_ change: (inout Camera) -> Void) {
+        guard let i = activeIndex else { return }
+        change(&library.boards[i].camera)
+        scheduleCameraSave()
+    }
+
+    private var cameraSaveTask: Task<Void, Never>?
+    private func scheduleCameraSave() {
+        cameraSaveTask?.cancel()
+        cameraSaveTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.5))
+            guard !Task.isCancelled else { return }
+            self?.saveLocalOnly()
+        }
+    }
+
+    /// Mueve en bloque un conjunto de piezas desde sus orígenes guardados: un solo publish y un solo
+    /// guardado por frame, en vez de uno por pieza. Arrastrar un grupo grande no debe re-renderizar
+    /// ni re-guardar la biblioteca entera una vez por cada pieza seleccionada.
+    func moveItems(origins: [UUID: CGPoint], by offset: CGSize) {
+        mutateBoard { board in
+            let now = Date()
+            for (id, origin) in origins {
+                guard let i = board.items.firstIndex(where: { $0.id == id }) else { continue }
+                board.items[i].origin = CGPoint(x: origin.x + offset.width, y: origin.y + offset.height)
+                board.items[i].modifiedAt = now
+            }
+        }
     }
 
     /// Tableros abiertos como pestañas.
